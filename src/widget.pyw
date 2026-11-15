@@ -88,6 +88,7 @@ import signal
 import atexit
 import tempfile
 import threading
+import collections
 import shutil
 import base64
 import socket
@@ -99,7 +100,7 @@ import urllib.error
 import tkinter as tk
 import tkinter.font as tkfont
 from datetime import datetime, timedelta, timezone
-from PIL import Image, ImageDraw, ImageTk
+from PIL import Image, ImageChops, ImageDraw, ImageTk
 
 # The Claude Code profiles live in their own module: it draws nothing and
 # imports no tkinter, which is what lets the bench exercise it against fake
@@ -288,8 +289,31 @@ ESS_CONTROLS_INSET = 18  # gap the close/refresh/time block is placed at (place 
 ESS_MENU_W = 62   # hamburger pill width; reserves >= the bottom-right controls'
                   # footprint so the per-bar reset text never collides with them
 REFRESH  = 180_000  # 3 minutes
+GLIDE_S  = 0.6      # a bar moves to a new reading over this long; 0 = jump
+GLASS_POLL_MS = 400         # how often the answer of the screen look is picked up
+GLASS_TINT_MS = 4000       # how often the screen round the glass is looked at
+LIVE_TICK_MS = 5000       # the reset text re-reads the clock this often
+ACTIVITY_POLL_S = 4       # how often Claude Code's activity files are looked at
+ACTIVITY_SETTLE_S = 3     # wait after activity, so the usage has been recorded
+ACTIVITY_MIN_GAP_S = 20   # never read the usage more often than this on activity
 GEOMETRY_WATCH_MS = 2000  # self-heal poll interval: detect live monitor-layout
                           # changes and reposition the widget (home / rescue)
+BOTTOM_PAD = 6        # the strip's / stack's bottom spacer
+BOTTOM_PAD_OPEN = 24  # the same, with the essential controls drawn over it
+
+# The widget's own size. Everything the widget is drawn from (bar and title
+# heights, paddings, the type it uses) is these base values times one factor,
+# bound once at start-up before a single widget exists, as the theme is: Tk
+# keeps the size a widget was created with, so a change asks for a restart.
+# SUB_LABEL_PADX and ESS_CONTROLS_INSET stay as they are, because the label
+# padding and the placed control block they describe are written as the same
+# literal pixels where they are laid out.
+DEFAULT_UI_SCALE = 1.25
+UI_SCALE_CHOICES = (1.0, 1.25, 1.5, 1.75)
+UI_SCALE = 1.0
+_SIZE_BASE = {'DEF_W': 280, 'MIN_W': 210, 'MIN_W_ESS': 150, 'PAD': 12,
+              'BAR_H': 16, 'TITLE_H': 28, 'DOT_DIAM': 7, 'ESS_MENU_W': 62,
+              'BOTTOM_PAD': 6, 'BOTTOM_PAD_OPEN': 24}
 ICON_CELL_W = 34   # fixed icon-column width in menus so labels align across fonts
 ICON_CELL_H = 26
 
@@ -321,6 +345,9 @@ _FONT_SPECS = {
     'FT_MENU_B':    ('Segoe UI', 10, 'bold'),   # Menu row text, selected
 }
 
+# The fonts the widget itself is drawn in. The dialogs and the menu keep theirs.
+_WIDGET_FONTS = ('FT', 'FT_B', 'FT_S', 'FT_BAR')
+
 # Latin family -> family holding the same role that has Japanese glyphs.
 JP_FAMILY = {
     'Segoe UI':          'Yu Gothic UI',
@@ -337,7 +364,9 @@ def init_fonts(root, lang):
     for name, spec in _FONT_SPECS.items():
         globals()[name] = tkfont.Font(
             root=root, name='cu_' + name, exists=False,
-            family=_family_for(spec[0], lang), size=spec[1],
+            family=_family_for(spec[0], lang),
+            size=(sz(spec[1] + (1 if GLASS and name in ('FT', 'FT_B', 'FT_S', 'FT_BAR') else 0))
+                  if name in _WIDGET_FONTS else spec[1]),
             weight=spec[2] if len(spec) > 2 else 'normal',
             underline=int(len(spec) > 3 and spec[3] == 'underline'))
 
@@ -402,6 +431,205 @@ _DARK_THEME = {}
 
 
 THEME = 'dark'
+
+
+# ─── What the colour of a bar says ────────────────────────────────────
+# A bar is there to say "slow down" before the limit, not after. Its colour
+# follows how much of the limit is gone AND how fast it is going: 40% used
+# with 90% of the window still ahead is calm; 40% used with 10% of the window
+# gone is on course for 4x the limit, and that is red already.
+_TONE_STOPS = ((0.0, (48, 209, 88)),      # green: room to spare
+               (0.40, (255, 214, 10)),    # yellow: keep an eye on it
+               (0.68, (255, 149, 10)),    # orange: ease off
+               (1.0, (255, 69, 58)))      # red: stop, or wait for the reset
+
+
+def usage_pressure(pct, elapsed):
+    """0..1: how much `pct` percent of a limit used, `elapsed` (0..1, or None)
+    of the way through its window, calls for a change of pace."""
+    pct = max(0.0, min(100.0, float(pct)))
+    p_abs = max(0.0, min(1.0, (pct - 30.0) / 65.0))
+    p_pace = 0.0
+    if elapsed is not None and elapsed > 0.05 and pct >= 8:
+        projected = (pct / 100.0) / elapsed          # where it ends, at this pace
+        p_pace = (max(0.0, min(1.0, (projected - 0.75) / 0.55))
+                  * min(1.0, pct / 30.0))            # not on the first few percent
+    return max(p_abs, 0.92 * p_pace)
+
+
+def usage_tone(pct, elapsed=None):
+    """The fill colour for `pct` used, `elapsed` of the way through the window."""
+    p = usage_pressure(pct, elapsed)
+    for (a, ca), (b, cb) in zip(_TONE_STOPS, _TONE_STOPS[1:]):
+        if p <= b:
+            t = (p - a) / (b - a)
+            return '#%02x%02x%02x' % tuple(int(round(x + (y - x) * t)) for x, y in zip(ca, cb))
+    return '#%02x%02x%02x' % _TONE_STOPS[-1][1]
+
+
+# ─── The robot at work ────────────────────────────────────────────────
+# A small robot sits on the front of the session bar with its laptop, typing,
+# and rides along as the bar fills. Drawn with Pillow at 4x, 24 frames, in the
+# colours that sit on both themes (the Claude orange is its accent).
+ROBOT_FRAMES = 24
+ROBOT_FRAME_MS = 85
+ROBOT_BASE_H = 52            # its height at 100%
+_ROBOT_COLORS = {
+    'dark': dict(body='#eef1f8', body_shade='#c7ccdb', visor='#0f1116', eye='#6ee7d8',
+                 lid='#3a3e49', lid_hi='#565b69', base='#2a2d35', base_hi='#4a4f5d',
+                 shadow=(0, 0, 0), accent='#DA7756'),
+    'light': dict(body='#ffffff', body_shade='#d5d9e4', visor='#1b1f2a', eye='#22b8cf',
+                  lid='#aab1bf', lid_hi='#cfd4df', base='#8f97a6', base_hi='#b9bfcb',
+                  shadow=(60, 70, 90), accent='#DA7756'),
+}
+_ROBOT_PHOTOS = {}
+
+
+def render_robot(frame, height, theme):
+    """One frame of the robot, `height` px tall."""
+    from PIL import ImageFilter
+    c = _ROBOT_COLORS['dark' if theme == 'dark' else 'light']
+    SS, OY = 4, 4
+    Uu = height / 76.0                                  # one design unit, in px
+    W, H = int(round(86 * Uu)), int(round(height))
+    img = Image.new('RGBA', (W * SS, H * SS), (0, 0, 0, 0))
+    k = frame / ROBOT_FRAMES
+    pulse = 0.5 + 0.5 * math.sin(2 * math.pi * k)
+    rgb = lambda h: _hex_to_rgb(h)
+
+    def S(v):
+        return v * Uu * SS
+
+    def rr(x0, y0, x1, y1, r, fill, outline=None, w=0):
+        ImageDraw.Draw(img).rounded_rectangle(
+            (S(x0), S(y0 + OY), S(x1), S(y1 + OY)), radius=S(r), fill=fill,
+            outline=outline, width=int(S(w)) if w else 0)
+
+    def circ(cx, cy, r, fill):
+        ImageDraw.Draw(img).ellipse((S(cx - r), S(cy + OY - r), S(cx + r), S(cy + OY + r)), fill=fill)
+
+    def ln(x0, y0, x1, y1, fill, w):
+        ImageDraw.Draw(img).line((S(x0), S(y0 + OY), S(x1), S(y1 + OY)), fill=fill, width=int(S(w)))
+
+    def glow(cx, cy, r, color, alpha, blur):
+        g = Image.new('RGBA', img.size, (0, 0, 0, 0))
+        ImageDraw.Draw(g).ellipse((S(cx - r), S(cy + OY - r), S(cx + r), S(cy + OY + r)),
+                                  fill=rgb(color) + (alpha,))
+        img.alpha_composite(g.filter(ImageFilter.GaussianBlur(S(blur))))
+
+    sh = c['shadow']
+    shadow = Image.new('RGBA', img.size, (0, 0, 0, 0))
+    ImageDraw.Draw(shadow).ellipse((S(8), S(66 + OY), S(78), S(72 + OY)), fill=sh + (70,))
+    img.alpha_composite(shadow.filter(ImageFilter.GaussianBlur(S(1.6))))
+
+    ln(43, 11, 43, 4.5, rgb(c['body_shade']) + (255,), 1.6)           # antenna
+    glow(43, 3.4, 3.2 + 2.2 * pulse, c['accent'], int(60 + 90 * pulse), 1.5)
+    circ(43, 3.4, 2.5, rgb(c['accent']) + (255,))
+    circ(42.3, 2.7, 0.8, (255, 255, 255, 190))
+
+    rr(26, 10, 60, 38, 10, rgb(c['body']) + (255,))                    # head
+    rr(26, 10, 60, 38, 10, None, rgb(c['body_shade']) + (255,), 0.9)
+    circ(24.2, 25, 3.2, rgb(c['body_shade']) + (255,))
+    circ(61.8, 25, 3.2, rgb(c['body_shade']) + (255,))
+    rr(30, 15, 56, 30, 7, rgb(c['visor']) + (255,))                    # visor
+    eh = 1.0 if frame in (19, 20) else 5.2                             # a blink
+    for ex in (37, 49):
+        rr(ex - 2.3, 22.5 - eh / 2, ex + 2.3, 22.5 + eh / 2, 2.2, rgb(c['eye']) + (255,))
+    ImageDraw.Draw(img).arc((S(31.5), S(16.5 + OY), S(45), S(28 + OY)), 200, 250,
+                            fill=(255, 255, 255, 60), width=int(S(0.9)))
+
+    taps = [0, 2.0, 0.4, 1.4, 0, 2.2, 0.6, 1.6]                        # two hands, out of step
+    lh = taps[(frame // 2) % 8]
+    rh = taps[((frame + 3) // 2) % 8]
+    bodyc = rgb(c['body']) + (255,)
+    ln(22, 46, 30, 61.5 - lh, bodyc, 4.4)
+    ln(64, 46, 56, 61.5 - rh, bodyc, 4.4)
+
+    rr(14, 34, 72, 62, 5, rgb(c['lid']) + (255,))                      # the lid, from behind
+    rr(14, 34, 72, 62, 5, None, rgb(c['lid_hi']) + (255,), 0.9)
+    glow(43, 48, 9, c['accent'], int(40 + 70 * pulse), 3)
+    ac = rgb(c['accent']) + (255,)
+    for a in range(0, 360, 60):                                        # the mark
+        ang = math.radians(a + 90)
+        ln(43 - 5.2 * math.cos(ang), 48 - 5.2 * math.sin(ang),
+           43 + 5.2 * math.cos(ang), 48 + 5.2 * math.sin(ang), ac, 2.2)
+    rr(10, 61, 76, 67, 3, rgb(c['base']) + (255,))                     # the base
+    rr(10, 61, 76, 67, 3, None, rgb(c['base_hi']) + (255,), 0.8)
+    circ(30, 62 - lh, 3.4, bodyc)
+    circ(56, 62 - rh, 3.4, bodyc)
+    for i, sx in enumerate((25, 31, 37, 49, 55, 61)):                  # keys lighting up
+        if (frame + i * 3) % 7 < 2:
+            rr(sx - 2, 64.5 - 0.6, sx + 2, 64.5 + 0.6, 0.6, rgb(c['accent']) + (210,))
+    out = img.resize((W, H), Image.LANCZOS)
+    if FROST:
+        r, g, b, a = out.split()
+        sub = lambda ch, v: ImageChops.subtract(ch, Image.new('L', ch.size, v))
+        out = Image.merge('RGBA', (sub(r, FROST_B0[0]), sub(g, FROST_B0[1]), sub(b, FROST_B0[2]), a))
+    return out
+
+
+def sz(n):
+    """`n` points or pixels of the widget's own drawing, at the chosen size."""
+    return max(1, int(round(n * UI_SCALE)))
+
+
+def scale_setting(cfg):
+    """The size factor from the config, bounded; the default when it is
+    missing or is not a number."""
+    try:
+        f = float(cfg.get('ui_scale', DEFAULT_UI_SCALE))
+    except (TypeError, ValueError):
+        return DEFAULT_UI_SCALE
+    return max(1.0, min(2.0, f)) if f == f else DEFAULT_UI_SCALE
+
+
+def apply_scale(f):
+    """Rebind the size globals for factor `f`. Must run before the fonts and
+    the widgets are built, and only once."""
+    g = globals()
+    g['UI_SCALE'] = f
+    bases = dict(_SIZE_BASE)
+    if g.get('GLASS'):
+        bases.update(_GLASS_SIZE_BASE)
+    for name, base in bases.items():
+        g[name] = int(round(base * f))
+    g['BAR_H'] += g['BAR_H'] % 2          # the bar's end caps want an even height
+    g['DOT_INSET'] = g['BAR_H'] // 2
+    # The corner dots sit clear of the rounded corners (a round corner takes
+    # the corner of the window, and the dots with it, at this radius).
+    g['DOT_X'] = sz(15) if g.get('GLASS') else 6
+    g['DOT_Y'] = sz(17) if g.get('GLASS') else 4
+    g['FT_EMOJI_W'] = ('Segoe UI Emoji', sz(10))
+    g['FT_DOT_W'] = ('Segoe UI', sz(10))
+    g['FT_MDL2_W'] = ('Segoe MDL2 Assets', sz(9))
+
+
+def migrate_scale(cfg, f):
+    """Carry the saved widths over to the size now in use.
+
+    A layout saved at one size is wrong at another: a strip kept at 280 px
+    would come up at 280 px of bigger type and clip. The factor the saved sizes
+    belong to is remembered next to them; a config from before sizes existed
+    was saved at 1.0. Returns True when something changed."""
+    try:
+        prev = float(cfg.get('ui_scale_applied', 1.0 if 'width' in cfg else f))
+    except (TypeError, ValueError):
+        prev = 1.0
+    if prev <= 0:
+        prev = 1.0
+    changed = cfg.get('ui_scale_applied') != f
+    if abs(prev - f) > 1e-6:
+        r = f / prev
+        for key in ('width', 'height'):
+            if isinstance(cfg.get(key), (int, float)):
+                cfg[key] = int(round(cfg[key] * r))
+        ess = cfg.get('ess_width')
+        if isinstance(ess, dict):
+            for k, v in list(ess.items()):
+                if isinstance(v, (int, float)):
+                    ess[k] = int(round(v * r))
+    cfg['ui_scale_applied'] = f
+    return changed
 
 
 def apply_theme(name):
@@ -833,6 +1061,25 @@ LANG = {
         'menu_autostart_off': 'Start with Windows: OFF',
         'menu_taskbar_on': 'Taskbar icon: ON',
         'menu_taskbar_off': 'Taskbar icon: OFF',
+        'menu_size': 'Size',
+        'menu_robot_on': 'Robot at work: ON',
+        'menu_robot_off': 'Robot at work: OFF',
+        'tip_robot': 'A small robot sits on the session bar, typing on its laptop, and rides along as it fills.',
+        'menu_dodge_on': 'Move out of the way: ON',
+        'menu_dodge_off': 'Move out of the way: OFF',
+        'tip_dodge': 'When the widget covers a window and the pointer comes to it, it slides clear and comes back afterwards. Hold Ctrl to keep it in place.',
+        'tray_tip_on': 'Claude Usage - moves out of the way: ON (click to turn off)',
+        'tray_tip_off': 'Claude Usage - moves out of the way: OFF (click to turn on)',
+        'tray_dodge': 'Move out of the way',
+        'tray_menu': 'Open the menu',
+        'tray_home': 'Back to its place',
+        'menu_appearance': 'Look',
+        'look_frost': 'Frost (see-through)',
+        'look_glass': 'Glass',
+        'look_classic': 'Classic',
+        'menu_live_on': 'Live updates: ON',
+        'menu_live_off': 'Live updates: OFF',
+        'tip_live': 'Read the usage again soon after Claude Code is used, instead of waiting for the next refresh.',
         'menu_countdown': 'Countdown',
         'countdown_full': 'Numeric',
         'countdown_dot': 'Dot',
@@ -1107,6 +1354,25 @@ LANG = {
         'menu_autostart_off': 'Avvia con Windows: disattivo',
         'menu_taskbar_on': 'Icona taskbar: visibile',
         'menu_taskbar_off': 'Icona taskbar: nascosta',
+        'menu_size': 'Dimensione',
+        'menu_robot_on': 'Robot al lavoro: attivo',
+        'menu_robot_off': 'Robot al lavoro: spento',
+        'tip_robot': 'Un piccolo robot siede sulla barra della sessione e scrive al computer, avanzando con essa.',
+        'menu_dodge_on': 'Si sposta se copre: attivo',
+        'menu_dodge_off': 'Si sposta se copre: spento',
+        'tip_dodge': 'Se il widget copre una finestra e il puntatore si avvicina, si sposta e poi torna al suo posto. Tieni premuto Ctrl per fermarlo.',
+        'tray_tip_on': 'Claude Usage - si sposta se copre: attivo (clic per spegnere)',
+        'tray_tip_off': 'Claude Usage - si sposta se copre: spento (clic per attivare)',
+        'tray_dodge': 'Si sposta se copre',
+        'tray_menu': 'Apri il menu',
+        'tray_home': 'Torna al suo posto',
+        'menu_appearance': 'Aspetto',
+        'look_frost': 'Vetro satinato (trasparente)',
+        'look_glass': 'Vetro',
+        'look_classic': 'Classico',
+        'menu_live_on': 'Aggiornamento in tempo reale: attivo',
+        'menu_live_off': 'Aggiornamento in tempo reale: spento',
+        'tip_live': "Rilegge il consumo subito dopo l'uso di Claude Code, senza aspettare il prossimo aggiornamento.",
         'menu_countdown': 'Conto alla rovescia',
         'countdown_full': 'Numerico',
         'countdown_dot': 'Puntino',
@@ -1395,6 +1661,25 @@ LANG = {
         'menu_autostart_off': 'Windows\u8d77\u52d5\u6642\u306b\u958b\u59cb: \u30aa\u30d5',
         'menu_taskbar_on': '\u30bf\u30b9\u30af\u30d0\u30fc\u30a2\u30a4\u30b3\u30f3: \u8868\u793a',
         'menu_taskbar_off': '\u30bf\u30b9\u30af\u30d0\u30fc\u30a2\u30a4\u30b3\u30f3: \u975e\u8868\u793a',
+        'menu_size': '\u30b5\u30a4\u30ba',
+        'menu_robot_on': '\u30ed\u30dc\u30c3\u30c8: \u30aa\u30f3',
+        'menu_robot_off': '\u30ed\u30dc\u30c3\u30c8: \u30aa\u30d5',
+        'tip_robot': '\u5c0f\u3055\u306a\u30ed\u30dc\u30c3\u30c8\u304c\u30d0\u30fc\u306e\u4e0a\u3067\u4f5c\u696d\u3057\u307e\u3059\u3002',
+        'menu_dodge_on': '\u907f\u3051\u308b: \u30aa\u30f3',
+        'menu_dodge_off': '\u907f\u3051\u308b: \u30aa\u30d5',
+        'tip_dodge': '\u30a6\u30a3\u30b8\u30a7\u30c3\u30c8\u304c\u30a6\u30a3\u30f3\u30c9\u30a6\u3092\u8986\u3063\u3066\u3044\u3066\u30dd\u30a4\u30f3\u30bf\u30fc\u304c\u8fd1\u3065\u304f\u3068\u3001\u81ea\u52d5\u3067\u3069\u3051\u307e\u3059\u3002 Ctrl \u3067\u56fa\u5b9a\u3002',
+        'tray_tip_on': 'Claude Usage - \u907f\u3051\u308b: \u30aa\u30f3',
+        'tray_tip_off': 'Claude Usage - \u907f\u3051\u308b: \u30aa\u30d5',
+        'tray_dodge': '\u907f\u3051\u308b',
+        'tray_menu': '\u30e1\u30cb\u30e5\u30fc\u3092\u958b\u304f',
+        'tray_home': '\u5143\u306e\u4f4d\u7f6e\u3078',
+        'menu_appearance': '\u5916\u89b3',
+        'look_frost': '\u30d5\u30ed\u30b9\u30c8 (\u900f\u904e)',
+        'look_glass': '\u30ac\u30e9\u30b9',
+        'look_classic': '\u30af\u30e9\u30b7\u30c3\u30af',
+        'menu_live_on': '\u30ea\u30a2\u30eb\u30bf\u30a4\u30e0\u66f4\u65b0: \u30aa\u30f3',
+        'menu_live_off': '\u30ea\u30a2\u30eb\u30bf\u30a4\u30e0\u66f4\u65b0: \u30aa\u30d5',
+        'tip_live': 'Claude Code \u3092\u4f7f\u3063\u305f\u76f4\u5f8c\u306b\u4f7f\u7528\u72b6\u6cc1\u3092\u518d\u53d6\u5f97\u3057\u307e\u3059\u3002',
         'menu_countdown': '\u30ab\u30a6\u30f3\u30c8\u30c0\u30a6\u30f3',
         'countdown_full': '\u6570\u5024',
         'countdown_dot': '\u30c9\u30c3\u30c8',
@@ -2665,6 +2950,17 @@ def _rgb_to_hex(rgb):
     return '#%02x%02x%02x' % tuple(max(0, min(255, round(c))) for c in rgb)
 
 
+def bar_track(fill_hex):
+    """The empty part of a bar. In the glass looks it is the panel's own
+    neutral, with only a trace of the fill in it: a dark shade of the fill's
+    hue (a brown under an orange fill) sat on the blue-grey panel as a muddy
+    stripe and did not go with anything round it. The colour picker keeps
+    derive_track."""
+    if GLASS:
+        return _lerp_hex(BAR_BG, fill_hex, 0.07)
+    return derive_track(fill_hex)
+
+
 def derive_track(fill_hex):
     """The 'unused' track colour for a bar fill, in the current theme.
 
@@ -3089,6 +3385,408 @@ def dwm_round(win, shadow=True):
 
 
 # ═══════════════════════════════════════════════════════
+# Glass
+# ═══════════════════════════════════════════════════════
+# The widget's own look, after macOS: a deep glass panel with a lighter title
+# band, tubes for bars that carry a pane of light, no outline, and more room
+# (taller bars, a taller title, more air between the rows).
+#
+# 🔴 It is NOT see-through. Tk paints every pixel opaque, and the ways round
+# that were measured on 2026-11-15 and given up: Windows' acrylic backdrop set
+# on the window showed no blur at all (screen captures and the user's own eyes
+# agree), and a colour-keyed window makes every label click-through. So the
+# glass ADAPTS instead: the colour of what the widget sits on is read from a
+# ring of screen just outside its edges (the widget itself cannot be left out
+# of a capture of its own area), and the panel is tinted towards it. The
+# widget follows the screen it is on; it does not show it.
+#
+# The glass is opaque (alpha 1.0), on purpose: a translucent window is a
+# layered window, which Windows recomposites in full on every move, and the
+# widget is dragged, slid and resized. The resize already dropped to 1.0 for
+# that reason; without anything to see through, the rest has no use for it.
+#
+# "classic" in the menu brings the previous look back whole.
+# ── Frost: the real thing, on a dark theme ──
+# Measured on 2026-11-15, after every earlier attempt showed no blur: Windows'
+# acrylic backdrop is applied to a window that is NOT layered (no -alpha below
+# 1: a translucent window is a layered one, and it gets no backdrop; that is
+# why every first try, all translucent, looked the same as no effect), with
+# the frame extended over the whole client area. The backdrop then shows
+# wherever the widget paints PURE BLACK; any other colour is ADDED to it
+# (the surface has no alpha channel for GDI to write), so the widget is drawn
+# on black and its colours are light on dark. It follows that dark text on a
+# light frost cannot be drawn: Frost is for the dark theme, and the light
+# theme keeps the opaque glass.
+FROST = False
+FROST_HDR_SKIPPED = False
+FROST_BLACK = '#000000'
+_GLASS_HWNDS = set()      # windows carrying the backdrop (the widget's picture of itself too)
+GLASS = False
+GLASS_ALPHA = {'dark': 1.0, 'light': 1.0}   # opaque: see the note on dragging below
+CLASSIC_ALPHA = 0.94
+# Where the glass starts, before the screen has been looked at.
+GLASS_THEME = {
+    # The menu, its flyout and the dialogs are made of these too (MENU_BG,
+    # SOFT_BG): left at the original flat grey they read as another program
+    # beside the glass widget.
+    'dark': {'BG': '#1b1d23', 'BG_TITLE': '#1b1d23', 'BAR_BG': '#2b2e36',
+             'HOVER_BG': '#2d313a', 'FG': '#f5f6f8', 'DIM': '#b4b8c1',
+             'MENU_BG': '#1f2229', 'SOFT_BG': '#272b33', 'SOFT_BG_HV': '#303540',
+             'CLOSE_HV': '#3a1c22'},
+    'light': {'BG': '#f3f4f7', 'BG_TITLE': '#f3f4f7', 'BAR_BG': '#dfe2e8',
+              'HOVER_BG': '#e7e9ee', 'FG': '#1a1c20', 'DIM': '#5a5e67',
+              'MENU_BG': '#fbfbfd', 'SOFT_BG': '#eceef3', 'SOFT_BG_HV': '#e1e4ec',
+              'CLOSE_HV': '#f6dde0'},
+}
+# What the widget is drawn from in glass: more height, above all.
+_GLASS_SIZE_BASE = {'DEF_W': 410, 'MIN_W': 270, 'PAD': 21, 'BAR_H': 32,
+                    'TITLE_H': 50, 'ESS_MENU_W': 82, 'BOTTOM_PAD': 20,
+                    'BOTTOM_PAD_OPEN': 36}
+ROW_GAP, BAR_GAP, SUB_GAP = 3, 1, 2        # classic; glass sets its own
+ROUND_R = 18               # corner radius of the glass looks (px at 100%: about 22 px at the default size); user: 38 px too round, 12 px too tight
+ROUND_R_MENU = 11          # and of their menus and dialogs
+
+
+_HDR = {'t': 0.0, 'map': {}}
+
+
+def hdr_map():
+    """{GDI device name: HDR (advanced colour) is on} for every active display,
+    from the display configuration API; {} when it cannot be read. Kept for a
+    few seconds: it is asked about at every look at where the widget is.
+
+    🔴 Why it matters. Measured on 2026-11-15 on the user's machine: the Frost
+    look builds its see-through from pixels that are ADDED to the backdrop
+    (see the note at FROST), which a normal 8-bit display accepts and a display
+    in HDR does not: there everything the widget paints but its text vanished
+    (the logo, the bar, the robot), while screenshots, which are always taken
+    in normal colour, showed all of it. The laptop panel (Intel graphics) was
+    in HDR; the external monitor (NVIDIA) was not, and showed it all."""
+    now = time.monotonic()
+    if now - _HDR['t'] < 3.0:
+        return _HDR['map']
+    result = {}
+    try:
+        from ctypes import wintypes as wt
+        u = ctypes.windll.user32
+
+        class LUID(ctypes.Structure):
+            _fields_ = [('lo', wt.DWORD), ('hi', wt.LONG)]
+
+        class HDRH(ctypes.Structure):
+            _fields_ = [('type', ctypes.c_int), ('size', wt.UINT), ('adapterId', LUID), ('id', wt.UINT)]
+
+        class ADV(ctypes.Structure):
+            _fields_ = [('header', HDRH), ('value', wt.UINT), ('colorEncoding', ctypes.c_int),
+                        ('bitsPerColorChannel', wt.UINT)]
+
+        class SRC(ctypes.Structure):
+            _fields_ = [('header', HDRH), ('name', ctypes.c_wchar * 32)]
+
+        class PATH(ctypes.Structure):
+            _fields_ = [('sourceInfo', ctypes.c_byte * 20), ('targetInfo', ctypes.c_byte * 48),
+                        ('flags', wt.UINT)]
+
+        class MODE(ctypes.Structure):
+            _fields_ = [('raw', ctypes.c_byte * 64)]
+
+        nP, nM = wt.UINT(), wt.UINT()
+        if u.GetDisplayConfigBufferSizes(0x2, ctypes.byref(nP), ctypes.byref(nM)) == 0:
+            paths, modes = (PATH * nP.value)(), (MODE * nM.value)()
+            if u.QueryDisplayConfig(0x2, ctypes.byref(nP), paths, ctypes.byref(nM), modes, None) == 0:
+                for k in range(nP.value):
+                    sraw, traw = bytes(paths[k].sourceInfo), bytes(paths[k].targetInfo)
+                    sad, sid = LUID.from_buffer_copy(sraw[0:8]), int.from_bytes(sraw[8:12], 'little')
+                    tad, tid = LUID.from_buffer_copy(traw[0:8]), int.from_bytes(traw[8:12], 'little')
+                    src = SRC()
+                    src.header = HDRH(1, ctypes.sizeof(SRC), sad, sid)      # GET_SOURCE_NAME
+                    adv = ADV()
+                    adv.header = HDRH(9, ctypes.sizeof(ADV), tad, tid)      # GET_ADVANCED_COLOR_INFO
+                    if (u.DisplayConfigGetDeviceInfo(ctypes.byref(src)) == 0
+                            and u.DisplayConfigGetDeviceInfo(ctypes.byref(adv)) == 0):
+                        result[src.name] = bool(adv.value & 2)
+    except Exception as e:
+        wlog(f'HDR    could not be read: {e}')
+    _HDR['t'], _HDR['map'] = now, result
+    return result
+
+
+def frost_supported_here(x, y, w, h):
+    """Can the Frost look be used on the display the rectangle is on: Windows
+    11 build 22621 or later, and that display is not in HDR."""
+    try:
+        if sys.getwindowsversion().build < 22621:
+            return False
+        info = _monitor_of(int(x), int(y), max(1, int(w)), max(1, int(h)), _MONITOR_DEFAULTTONEAREST)
+        return not (info and hdr_map().get(info[0], False))
+    except Exception:
+        return True
+
+
+def apply_appearance(name, where=None):
+    """Bind the glass palette over the theme's, and its spacing, for 'glass';
+    'classic' leaves everything as it was. Once, after apply_theme and BEFORE
+    apply_scale, which reads GLASS for the sizes."""
+    g = globals()
+    g['GLASS'] = name != 'classic'
+    try:
+        has_backdrop = sys.getwindowsversion().build >= 22621
+    except Exception:
+        has_backdrop = False
+    g['FROST'] = (name == 'frost' and has_backdrop and g.get('THEME', 'dark') == 'dark')
+    g['FROST_HDR_SKIPPED'] = False
+    if g['FROST'] and where and not os.environ.get('CLAUDE_USAGE_FORCE_FROST'):
+        if not frost_supported_here(*where):
+            g['FROST'] = False                  # on an HDR display: the opaque glass instead
+            g['FROST_HDR_SKIPPED'] = True
+    if g['GLASS']:
+        g.update(GLASS_THEME[g.get('THEME', 'dark')])
+        g['ROW_GAP'], g['BAR_GAP'], g['SUB_GAP'] = 17, 7, 9
+        if g['FROST']:
+            g['DIM'] = '#8d919c'      # the frost is added to it
+        _INK_CACHE.clear()
+
+
+def rest_alpha():
+    """The widget's translucency at rest. None for the glass looks, and for
+    the frost above all: any alpha below 1 makes the window a layered one."""
+    return GLASS_ALPHA.get(THEME, 0.97) if GLASS else CLASSIC_ALPHA
+
+
+class _MARGINS(ctypes.Structure):
+    _fields_ = [('l', ctypes.c_int), ('r', ctypes.c_int),
+                ('t', ctypes.c_int), ('b', ctypes.c_int)]
+
+
+class _ACCENT(ctypes.Structure):
+    _fields_ = [('state', ctypes.c_int), ('flags', ctypes.c_int),
+                ('color', ctypes.c_uint), ('animation', ctypes.c_int)]
+
+
+class _WCAD(ctypes.Structure):
+    _fields_ = [('attribute', ctypes.c_int), ('data', ctypes.c_void_p),
+                ('size', ctypes.c_size_t)]
+
+
+# AABBGGRR: how much of a dark blue-grey is laid over the blurred screen. More
+# alpha = a darker, calmer frost; less = more of the screen behind shows.
+FROST_TINT = 0x55181210
+# What the frost itself is worth at a typical spot (r, g, b): everything the
+# widget paints is ADDED to it, so a colour that should come out as C is
+# painted as C minus this. Measured against the screen, over light and dark
+# windows behind.
+FROST_B0 = (24, 26, 31)
+
+
+def frost_blur(hwnd, w, h, r):
+    """Blur what is behind the window, within the widget's own rounded shape.
+    True when Windows took it.
+
+    🔴 Measured 2026-11-15. The acrylic accent (SetWindowCompositionAttribute
+    state 4, and the plain blur state 3) ignores the window's shape: it filled
+    the whole square, so behind the rounded panel there was a dark square with
+    corners of another radius, and Windows' own corner rounding and shadow
+    (a dark halo, 25% darker than the backdrop) sat under that. This call
+    (DwmEnableBlurBehindWindow) takes the shape as a region and blurs only
+    inside it. It does not tint: the dark of the frost is a layer of ours under
+    the widget (Tint)."""
+    try:
+        from ctypes import wintypes as wt
+
+        class _BB(ctypes.Structure):
+            _fields_ = [('flags', wt.DWORD), ('enable', wt.BOOL), ('rgn', wt.HANDLE), ('trans', wt.BOOL)]
+        gdi = ctypes.windll.gdi32
+        gdi.CreateRoundRectRgn.restype = wt.HANDLE
+        rgn = gdi.CreateRoundRectRgn(0, 0, int(w) + 1, int(h) + 1, int(r) * 2, int(r) * 2)
+        rc = ctypes.windll.dwmapi.DwmEnableBlurBehindWindow(hwnd, ctypes.byref(_BB(3, True, rgn, False)))
+        gdi.DeleteObject(wt.HANDLE(rgn))
+        return rc == 0
+    except Exception:
+        return False
+
+
+def frost_backdrop(hwnd, w=0, h=0, r=0):
+    """Give a window the frosted backdrop. True when Windows took it.
+
+    The older blur API, not the DwmSetWindowAttribute backdrop type: measured
+    on 2026-11-15, that one blurs only while its window is the active one, and
+    the widget never is (it must not take the focus). See frost_blur."""
+    try:
+        ctypes.windll.dwmapi.DwmExtendFrameIntoClientArea(
+            hwnd, ctypes.byref(_MARGINS(-1, -1, -1, -1)))
+        dark = ctypes.c_int(1)                       # DWMWA_USE_IMMERSIVE_DARK_MODE
+        ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 20, ctypes.byref(dark), 4)
+        ok = frost_blur(hwnd, w or 200, h or 100, r or 18)
+        if ok:
+            _GLASS_HWNDS.add(hwnd)
+        return ok
+    except Exception:
+        return False
+
+
+def corner_radius(hwnd=None):
+    """The widget's corner radius in px."""
+    return sz(ROUND_R)
+
+
+def glass_no_border(hwnd):
+    """Take the 1px outline Windows 11 draws round the window away
+    (DWMWA_BORDER_COLOR = DWMWA_COLOR_NONE)."""
+    try:
+        val = ctypes.c_uint(0xFFFFFFFE)
+        ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 34, ctypes.byref(val), 4)
+        # And the rounding and the shadow Windows 11 gives a window of its own:
+        # the widget is cut to its own corner radius (SetWindowRgn), and under it
+        # Windows kept drawing a dark shadow and its default 8 px rounding, which
+        # showed as a second, differently rounded shape behind the widget.
+        pref = ctypes.c_int(1)                       # DWMWCP_DONOTROUND
+        ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 33, ctypes.byref(pref), 4)
+    except Exception:
+        pass
+
+
+def screen_tint(x, y, w, h, margin=28):
+    """The average colour of the screen just outside the rectangle, as
+    (r, g, b), or None. A ring `margin` px wide on every side that is on a
+    screen: the widget's own pixels are never in it."""
+    try:
+        from PIL import ImageGrab
+        l, t, r, b = x - margin, y - margin, x + w + margin, y + h + margin
+        img = ImageGrab.grab(bbox=(l, t, r, b), all_screens=True).convert('RGB')
+        iw, ih = img.size
+        if iw < 4 or ih < 4:
+            return None
+        # Four strips; one that falls off the screen is black, so it is
+        # recognised and left out (a window parked at an edge has three).
+        strips = []
+        for box in ((0, 0, iw, margin), (0, ih - margin, iw, ih),
+                    (0, margin, margin, ih - margin), (iw - margin, margin, iw, ih - margin)):
+            if box[2] - box[0] < 1 or box[3] - box[1] < 1:
+                continue
+            c = img.crop(box).resize((1, 1), Image.BOX).getpixel((0, 0))
+            if max(c) > 0:
+                strips.append(c)
+        if not strips:
+            return None
+        return tuple(sum(c[i] for c in strips) // len(strips) for i in range(3))
+    except Exception:
+        return None
+
+
+def frost_level(x, y, w, h):
+    """The brightness of the frost itself, as (r, g, b): read from two strips of
+    the widget's own side margins, which nothing is painted on (black, so what
+    is there is the frost alone). None when it cannot be read."""
+    try:
+        from PIL import ImageGrab
+        px = []
+        for gx in (x + 3, x + w - 11):
+            strip = ImageGrab.grab(bbox=(gx, y + int(h * 0.32), gx + 8, y + int(h * 0.68)),
+                                   all_screens=True).convert('RGB')
+            px.append(strip.resize((1, 1), Image.BOX).getpixel((0, 0)))
+        return tuple(sum(c[i] for c in px) // len(px) for i in range(3))
+    except Exception:
+        return None
+
+
+def glass_colors(tint, dark):
+    """(body, title) colours of the panel for a screen of colour `tint`: the
+    theme's glass pulled a measured way towards it, and the title band a step
+    lighter. Held inside a range that keeps the text readable whatever is
+    behind."""
+    base = (27, 29, 35) if dark else (243, 244, 247)
+    k = 0.16 if dark else 0.12
+    body = tuple(int(round(b + (t - b) * k)) for b, t in zip(base, tint or base))
+    if dark:
+        body = tuple(max(14, min(62, c)) for c in body)
+    else:
+        body = tuple(max(212, min(250, c)) for c in body)
+    # One colour for the title and the body, as one sheet of glass: a hairline
+    # below the title is all that separates them (macOS toolbars do the same).
+    hexc = lambda c: '#%02x%02x%02x' % c
+    return hexc(body), hexc(body)
+
+
+def _shade(rgb, k):
+    """`rgb` k of the way towards white (k > 0) or black (k < 0)."""
+    t = 255 if k > 0 else 0
+    k = abs(k)
+    return tuple(int(round(c + (t - c) * k)) for c in rgb)
+
+
+def _vgrad(w, h, top, bot):
+    g = Image.linear_gradient('L').resize((w, h), Image.BILINEAR)
+    return Image.composite(Image.new('RGB', (w, h), bot), Image.new('RGB', (w, h), top), g)
+
+
+_GLASS_BAR_CACHE = {}
+
+
+def glass_bar_image(w, h, fw, fill, track, bg):  # noqa: C901
+    """A bar drawn as a glass tube: `fw` px of `fill` (0 = empty) on `track`,
+    over the background `bg`. Drawn at 3x and brought down, so the curves are
+    smooth; cached, because a bar is redrawn on every frame of a glide."""
+    key = (w, h, fw, fill, track, bg)
+    hit = _GLASS_BAR_CACHE.get(key)
+    if hit is not None:
+        return hit
+    SS = 3
+    W, H = w * SS, h * SS
+    r = H // 2
+    base = Image.new('RGB', (W, H), _hex_to_rgb(bg))
+    white = (255, 255, 255)
+
+    def rr(x0, x1, y0=0, y1=None, radius=None):
+        m = Image.new('L', (W, H), 0)
+        ImageDraw.Draw(m).rounded_rectangle(
+            (x0, y0, x1, (H - 1) if y1 is None else y1),
+            radius=r if radius is None else radius, fill=255)
+        return m
+
+    tmask = rr(0, W - 1)
+    tr = _hex_to_rgb(track)
+    light = _relative_luminance(track) > 0.5
+    base.paste(_vgrad(W, H, _shade(tr, -0.10 if light else -0.38),
+                      _shade(tr, 0.03 if light else 0.05)), (0, 0), tmask)
+    if fw > 0:
+        FW = max(H, int(round(fw * SS)))
+        fmask = rr(0, FW - 1)
+        f = _hex_to_rgb(fill)
+        fg = Image.new('RGB', (W, H))
+        fg.paste(_vgrad(W, H // 2, _shade(f, 0.26), f), (0, 0))
+        fg.paste(_vgrad(W, H - H // 2, f, _shade(f, -0.26)), (0, H // 2))
+        base.paste(fg, (0, 0), fmask)
+        # the gloss: a pane of light over the upper half, fading downward
+        inset = 2 * SS
+        gm = rr(inset, FW - 1 - inset, SS, int(H * 0.52), radius=max(1, r - SS))
+        fade = Image.linear_gradient('L').resize((W, H)).point(
+            lambda v: max(0, int(132 * (1 - v / 140))))
+        base.paste(white, (0, 0, W, H), ImageChops.multiply(gm, fade))
+        # a hairline of specular on the very top edge
+        sp = Image.new('L', (W, H), 0)
+        ImageDraw.Draw(sp).line((r, SS // 2 + 1, FW - r, SS // 2 + 1), fill=120, width=SS)
+        base.paste(white, (0, 0, W, H), ImageChops.multiply(sp, fmask))
+        # light gathering at the leading edge
+        ew = min(FW, 16 * SS)
+        eg = Image.linear_gradient('L').rotate(90, expand=True).resize((ew, H))
+        edge = Image.new('L', (W, H), 0)
+        edge.paste(eg, (FW - ew, 0))
+        edge = ImageChops.multiply(edge, fmask).point(lambda v: int(v * 0.34))
+        base.paste(_shade(f, 0.6), (0, 0, W, H), edge)
+        # the lower rim a touch darker: what gives the tube its roundness
+        rim = Image.new('L', (W, H), 0)
+        ImageDraw.Draw(rim).line((r, H - SS, FW - r, H - SS), fill=70, width=SS)
+        base.paste(_shade(f, -0.5), (0, 0, W, H), ImageChops.multiply(rim, fmask))
+    if FROST:
+        base = ImageChops.subtract(base, Image.new('RGB', base.size, FROST_B0))
+    photo = ImageTk.PhotoImage(base.resize((w, h), Image.LANCZOS))
+    if len(_GLASS_BAR_CACHE) > 400:
+        _GLASS_BAR_CACHE.clear()
+    _GLASS_BAR_CACHE[key] = photo
+    return photo
+
+
+# ═══════════════════════════════════════════════════════
 # Per-monitor geometry (Win32)
 # ═══════════════════════════════════════════════════════
 # Tk's winfo_vroot* only expose the bounding box of all monitors, which stays
@@ -3499,6 +4197,13 @@ class _Still:
                 pref = ctypes.c_int(2)                     # DWMWCP_ROUND, as dwm_round
                 api['dwm'].DwmSetWindowAttribute(self.hwnd, _DWMWA_WINDOW_CORNER_PREFERENCE,
                                                  ctypes.byref(pref), ctypes.sizeof(pref))
+            if GLASS:
+                round_region(self.hwnd, w, h, sz(ROUND_R))
+            if hwnd in _GLASS_HWNDS:
+                # The widget's own picture frosts what is behind it as the
+                # widget does (its black is see-through in the picture too), or
+                # the frost would drop out while the widget is reshaped.
+                frost_backdrop(self.hwnd)
             u32.SendMessageW(self.hwnd, _STM_SETIMAGE, None, self._bmp)   # IMAGE_BITMAP
             if not self.seat(hwnd, show=True):
                 raise OSError('the still window could not be shown')
@@ -5204,9 +5909,19 @@ class Section:
         self._state = 'empty'            # 'empty' | 'missing' | 'ok' (see _render_reset)
         self._split = 0                  # 0 = whole; else the equal parts shown
         self._no_number = False          # a preview with no reading: no number drawn
+        self._disp = None                # percentage on screen while a glide runs; None = _pct
+        self._glide_job = None
+        self._bg = BG                    # the colour behind it (glass retints it)
+        self._window_s = None            # length of the limit's window, for the pace
+        self._oy = 0                     # room above the bar (the robot stands there)
+        self._robot = False
+        self._robot_i = 0
+        self._robot_job = None
+        self._color_now = None           # the colour on show while a glide runs
+        self._glide_from = None
 
         self.frame = tk.Frame(parent, bg=BG)
-        self.frame.pack(fill='x', padx=PAD, pady=(3, 0))
+        self.frame.pack(fill='x', padx=PAD, pady=(ROW_GAP, 0))
 
         self.hdr = tk.Frame(self.frame, bg=BG)
         self.hdr.pack(fill='x')
@@ -5217,13 +5932,13 @@ class Section:
 
         self.cv = tk.Canvas(self.frame, height=BAR_H, bg=BG,
                             highlightthickness=0, bd=0)
-        self.cv.pack(fill='x', pady=(1, 0))
+        self.cv.pack(fill='x', pady=(BAR_GAP, 0))
         self.cv.bind('<Configure>', lambda e: self._draw(e.width))
 
         self.lbl_sub = tk.Label(self.frame, text='', font=FT_S, fg=DIM, bg=BG,
                                 anchor='w', padx=6, pady=0, bd=0,
                                 highlightthickness=0)
-        self.lbl_sub.pack(fill='x', pady=(2, 0))
+        self.lbl_sub.pack(fill='x', pady=(SUB_GAP, 0))
 
     def set_compact(self, compact):
         self._compact = compact
@@ -5233,8 +5948,8 @@ class Section:
             self.cv.pack_forget()
             self.lbl_sub.pack_forget()
             self.hdr.pack(fill='x')
-            self.cv.pack(fill='x', pady=(1, 0))
-            self.lbl_sub.pack(fill='x', pady=(2, 0))
+            self.cv.pack(fill='x', pady=(BAR_GAP, 0))
+            self.lbl_sub.pack(fill='x', pady=(SUB_GAP, 0))
         self._draw(self.cv.winfo_width())
 
     def set_countdown(self, txt):
@@ -5283,6 +5998,7 @@ class Section:
         not, they kept them for good, with "error" underneath: one account's
         usage under another account's name (2026-09-25).
         """
+        self._stop_glide()
         self._pct = 0
         self._resets_at = None
         self._state = 'empty'
@@ -5362,7 +6078,56 @@ class Section:
             return
         self.lbl_sub.config(text=self.reset_display())
 
+    def set_bg(self, color):
+        """The colour behind the whole bar, for the glass that follows the
+        screen it is on."""
+        if color == self._bg:
+            return
+        self._bg = color
+        for w in (self.frame, self.hdr, self.lbl, self.lbl_info, self.cv, self.lbl_sub):
+            w.config(bg=color)
+        self._dot_bg = color if self._pct <= 0 else self._dot_bg
+        self._draw(self.cv.winfo_width())
+
+    def _stop_glide(self):
+        job, self._glide_job = self._glide_job, None
+        self._disp = None
+        self._color_now = None
+        if job:
+            try:
+                self.cv.after_cancel(job)
+            except (tk.TclError, ValueError):
+                pass
+
+    def _glide(self, start, from_color=None):
+        """Carry the bar from `start` to the real value over a moment, so a new
+        reading arrives as movement and not as a jump, and its colour with it.
+        Only what is drawn moves: _pct is already the true value for everything
+        else that reads it."""
+        self._stop_glide()
+        self._glide_from = from_color
+        end = self._pct
+        t0 = time.monotonic()
+        dur = GLIDE_S
+
+        def step():
+            self._glide_job = None
+            try:
+                k = min(1.0, (time.monotonic() - t0) / dur)
+                e = 1 - (1 - k) ** 3
+                self._disp = None if k >= 1 else start + (end - start) * e
+                self._color_now = (_lerp_hex(self._glide_from, self._color, e)
+                                   if (k < 1 and self._glide_from) else None)
+                self._draw(self.cv.winfo_width())
+                if k < 1:
+                    self._glide_job = self.cv.after(16, step)
+            except tk.TclError:
+                self._disp = None
+        step()
+
     def update(self, pct, resets_at):
+        was_ok, was_pct = self._state == 'ok', self._pct
+        self._stop_glide()
         self._resets_at = resets_at
         self._state = 'ok' if pct is not None else 'missing'
         if pct is None:
@@ -5371,15 +6136,19 @@ class Section:
             self._render_reset()
             self._draw(self.cv.winfo_width())
             return
+        prev_color = self._color
         self._pct = max(0, min(100, pct))
         if self._dynamic:
-            self._color = dynamic_fill(self._pct)
-            self._trackc = derive_track(self._color)
+            self._color = self._dyn_color()
+            self._trackc = bar_track(self._color)
         else:
             self._color = self._fill
             self._trackc = self._track
         self._render_reset()
-        self._draw(self.cv.winfo_width())
+        if was_ok and was_pct != self._pct and GLIDE_S > 0:
+            self._glide(was_pct, prev_color if self._dynamic else None)
+        else:
+            self._draw(self.cv.winfo_width())
 
     def set_split(self, parts):
         """Show the bar in `parts` equal parts, 0 to show it whole.
@@ -5415,7 +6184,65 @@ class Section:
         for k in range(1, self._split):
             x = round(w * k / self._split)
             col = _lerp_hex(under(x), ink_on(under(x)), 0.35)
-            self.cv.create_line(x, 4, x, BAR_H - 4, fill=col, tags='split')
+            self.cv.create_line(x, self._oy + 4, x, self._oy + BAR_H - 4, fill=col, tags='split')
+
+    def _elapsed_frac(self):
+        """How far through its window the limit is (0..1), or None."""
+        if not (self._resets_at and self._window_s):
+            return None
+        try:
+            left = (datetime.fromisoformat(self._resets_at)
+                    - datetime.now(timezone.utc)).total_seconds()
+        except (ValueError, TypeError):
+            return None
+        return max(0.0, min(1.0, 1.0 - left / self._window_s))
+
+    def _dyn_color(self):
+        """The colour the usage calls for: by how much and how fast in the
+        glass look (usage_tone), by level only in the classic one."""
+        if GLASS:
+            return usage_tone(self._pct, self._elapsed_frac())
+        return dynamic_fill(self._pct)
+
+    def refresh_tone(self):
+        """The pace changes as the window runs down even when the usage does
+        not, so the colour is looked at again between readings."""
+        if not (GLASS and self._dynamic and self._state == 'ok') or self._glide_job:
+            return
+        col = self._dyn_color()
+        if col != self._color:
+            self._color = col
+            self._trackc = bar_track(col)
+            self._draw(self.cv.winfo_width())
+
+    def enable_robot(self):
+        """Put the robot on this bar: a room above it for it to stand in."""
+        self._robot = True
+        self._oy = sz(ROBOT_BASE_H) - 5
+        self.cv.config(height=BAR_H + self._oy)
+        self._robot_tick()
+
+    def _robot_images(self):
+        h = sz(ROBOT_BASE_H)
+        key = (h, THEME)
+        imgs = _ROBOT_PHOTOS.get(key)
+        if imgs is None:
+            imgs = [ImageTk.PhotoImage(render_robot(i, h, THEME)) for i in range(ROBOT_FRAMES)]
+            _ROBOT_PHOTOS[key] = imgs
+        return imgs
+
+    def _robot_tick(self):
+        self._robot_job = None
+        try:
+            if self.cv.winfo_ismapped():
+                self._robot_i = (self._robot_i + 1) % ROBOT_FRAMES
+                self.cv.itemconfigure('robot', image=self._robot_images()[self._robot_i])
+                delay = ROBOT_FRAME_MS
+            else:
+                delay = 400                    # not on show: look again later
+            self._robot_job = self.cv.after(delay, self._robot_tick)
+        except tk.TclError:
+            pass
 
     def set_dynamic(self, on):
         """Switch this bar between the percentage-driven palette and its own
@@ -5424,8 +6251,8 @@ class Section:
             return
         self._dynamic = on
         if self._dynamic:
-            self._color = dynamic_fill(self._pct)
-            self._trackc = derive_track(self._color)
+            self._color = self._dyn_color()
+            self._trackc = bar_track(self._color)
         else:
             self._color = self._fill
             self._trackc = self._track
@@ -5445,26 +6272,74 @@ class Section:
     def _draw(self, w):
         if w < 2:
             return
+        pct = self._pct if self._disp is None else self._disp
+        oy = self._oy
+        col = self._color_now or self._color
         self.cv.delete('all')
         # Track: neutral gray while the bar is empty, its dark colour once used.
-        track = self._trackc if self._pct > 0 else BAR_BG
-        pill(self.cv, 0, 0, w, BAR_H, track)
-        if self._pct > 0:
-            fw = max(BAR_H, w * self._pct / 100)
-            pill(self.cv, 0, 0, fw, BAR_H, self._color)
-        pct_str = f'{self._pct:.0f}%' if self._pct > 0 else '0%'
+        if pct > 0:
+            track = bar_track(col) if self._color_now else self._trackc
+        else:
+            track = BAR_BG
+        fw = max(BAR_H, w * pct / 100) if pct > 0 else 0
+        if GLASS:
+            # Whole pixels, so the picture can be kept: fractions of a pixel
+            # are not visible and would make every glide frame a new image.
+            self._glass_img = glass_bar_image(w, BAR_H, int(round(fw)),
+                                              col, track, self._bg)
+            self.cv.create_image(0, oy, image=self._glass_img, anchor='nw')
+        else:
+            pill(self.cv, 0, oy, w, BAR_H, track)
+            if pct > 0:
+                pill(self.cv, 0, oy, fw, BAR_H, col)
+        pct_str = f'{pct:.0f}%' if pct > 0 else '0%'
         if self._compact and self._cd_txt:
             txt = f'{pct_str}  {self._cd_txt}'
         else:
             txt = pct_str
         if self._split and self._state == 'ok':
-            self._draw_split(w, fw if self._pct > 0 else 0)
+            self._draw_split(w, fw if pct > 0 else 0)
+        if self._robot:
+            # On the front of the fill, a little behind its edge, standing on
+            # the bar and riding along with it.
+            imgs = self._robot_images()
+            half = imgs[0].width() / 2
+            rx = min(max(fw - half * 0.5, half + 2), w - half - 2)
+            self.cv.create_image(rx, oy + 5, image=imgs[self._robot_i],
+                                 anchor='s', tags='robot')
         # The text is centred, so it sits on the fill once the bar is past
         # half and on the track before that. Ask the one it is actually on.
-        behind = self._color if (self._pct > 0 and fw >= w / 2) else track
+        behind = col if (pct > 0 and fw >= w / 2) else track
+        tx = w / 2
+        if GLASS and pct > 0:
+            # 🔴 On the fill, at its front, or on the empty part beside it:
+            # whichever it fits in whole. Centred, it was cut by the edge of
+            # the fill: one ink for the whole of it, so the half that fell on
+            # the other colour was dark on dark.
+            tw = FT_BAR.measure(txt)
+            gap = sz(10)
+            if fw >= tw + 2 * gap:
+                tx, behind = fw - gap - tw / 2, col
+            elif w - fw >= tw + 2 * gap:
+                tx, behind = fw + gap + tw / 2, track
+        halo = False
+        if GLASS and pct > 0:
+            tw = FT_BAR.measure(txt)
+            halo = not (fw >= tw + 2 * sz(10) or w - fw >= tw + 2 * sz(10))
         if not self._no_number:
-            self.cv.create_text(w / 2, BAR_H / 2 - 1, text=txt,
-                                fill=ink_on(behind), font=FT_BAR, anchor='center')
+            if halo:
+                # Wider than either part of the bar, so it lies across the edge
+                # between two colours: light, with a thin dark edge, which reads
+                # on both.
+                d = max(1, sz(1))
+                for ox, oy2 in ((-d, 0), (d, 0), (0, -d), (0, d), (-d, -d), (d, d), (-d, d), (d, -d)):
+                    self.cv.create_text(tx + ox, oy + BAR_H / 2 - 1 + oy2, text=txt,
+                                        fill='#14161b', font=FT_BAR, anchor='center')
+                self.cv.create_text(tx, oy + BAR_H / 2 - 1, text=txt,
+                                    fill='#ffffff', font=FT_BAR, anchor='center')
+            else:
+                self.cv.create_text(tx, oy + BAR_H / 2 - 1, text=txt,
+                                    fill=ink_on(behind), font=FT_BAR, anchor='center')
         # Pre-refresh breathing dot, centred on the bar's right rounded cap
         # (the centre of the ideal circle that completes the end semicircle).
         # Same glyph + size as the corner dots, at the pct text's vertical
@@ -5472,14 +6347,775 @@ class Section:
         # solid green for a real appear/disappear breathing pulse.
         if self._dot_phase == 'on':
             cx = w - DOT_INSET
-            cy = BAR_H / 2 - 1  # measured centre of the bar pill for this image
-            fill_w = max(BAR_H, w * self._pct / 100) if self._pct > 0 else 0
-            self._dot_bg = self._color if (self._pct > 0 and fill_w >= cx) else BAR_BG
+            cy = oy + BAR_H / 2 - 1  # measured centre of the bar pill for this image
+            fill_w = max(BAR_H, w * pct / 100) if pct > 0 else 0
+            self._dot_bg = col if (pct > 0 and fill_w >= cx) else BAR_BG
             q = round(self._dot_level * 12) / 12
             color = _lerp_hex(self._dot_bg, DOT_GREEN, q)
             self._dot_img = _dot_image(DOT_DIAM, color)
             self.cv.create_image(cx, cy, image=self._dot_img,
                                  anchor='center', tags='refresh_dot')
+
+
+# ═══════════════════════════════════════════════════════
+# Getting out of the way
+# ═══════════════════════════════════════════════════════
+# The widget sits above everything. When the pointer comes to it and it is
+# covering a window, it slides clear so what is under it can be read, and slides
+# back once the pointer has gone. Over the desktop or the taskbar it stays
+# where it is: nothing is being hidden. This part is the facts and the
+# arithmetic; Widget._dodge_* decides when.
+#
+# 🔴 What the widget is covering is decided from the windows under it, not
+# from pixels: a window with content there counts; the wallpaper, the taskbar,
+# invisible and click-through windows and the widget's own windows do not.
+
+TRAY_POLL_MS = 60           # how often the notification-area icon's queue is read
+HANDOFF_FADE_S = 0.28       # a restart crosses over from the old widget to the new in this long
+DODGE_POLL_MS = 40          # how often the pointer is looked at
+DODGE_DWELL_MS = 140        # in the widget this long before it moves
+DODGE_RETURN_MS = 550       # out of the way this long before it comes back
+DODGE_RETURN_MARGIN = 24    # the pointer must clear the home spot by this much
+DODGE_GAP = 8               # (unused now; see dodge_plan)
+DODGE_PASS_SPEED = 650      # px/s: a pointer faster than this is passing through, not stopping
+DODGE_ZONE = (130, 44)      # what is kept clear round the pointer: half width, half height (px at 100%)
+DODGE_MARGIN = 14           # and a little more (px at 100%)
+DODGE_MIN_SHIFT = 28        # a move smaller than this would not be seen (px at 100%)
+DODGE_SPRING_W = 15.0       # the slide's stiffness (rad/s): settles in about a third of a second
+DODGE_GLIDE_S = 0.28        # a slide takes about this long
+DODGE_FRAME_MS = 4          # one frame of a slide (each is applied at once, see _dodge_glide_to)
+
+_DESKTOP_CLASSES = frozenset((
+    'Progman', 'WorkerW', 'Shell_TrayWnd', 'Shell_SecondaryTrayWnd',
+    'NotifyIconOverflowWindow', 'TopLevelWindowForOverflowXamlIsland',
+    'XamlExplorerHostIslandWindow', 'Windows.UI.Core.CoreWindow',
+    'ForegroundStaging', 'MultitaskingViewFrame', 'EdgeUiInputTopWndClass'))
+_TASKBAR_CLASSES = frozenset(('Shell_TrayWnd', 'Shell_SecondaryTrayWnd'))
+# What a spot costs to go to: nothing under it, only the taskbar, a window.
+_COVER_COST = (0, 350, 1000)
+
+_DODGE_API = None
+
+
+def _dodge_api():
+    """The Win32 calls the dodge uses, with prototypes (64-bit handles), built
+    once; None when they cannot be had, and the dodge then does nothing."""
+    global _DODGE_API
+    if _DODGE_API is not None:
+        return _DODGE_API or None
+    try:
+        from ctypes import wintypes as wt
+        u32 = ctypes.WinDLL('user32', use_last_error=True)
+        dwm = ctypes.WinDLL('dwmapi')
+        enum = ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
+        u32.EnumWindows.argtypes = [enum, wt.LPARAM]
+        u32.IsWindowVisible.argtypes = [wt.HWND]
+        u32.IsIconic.argtypes = [wt.HWND]
+        u32.GetClassNameW.argtypes = [wt.HWND, wt.LPWSTR, ctypes.c_int]
+        u32.GetWindowTextW.argtypes = [wt.HWND, wt.LPWSTR, ctypes.c_int]
+        u32.GetWindowThreadProcessId.argtypes = [wt.HWND, ctypes.POINTER(wt.DWORD)]
+        u32.GetWindowLongW.argtypes = [wt.HWND, ctypes.c_int]
+        u32.GetWindowRect.argtypes = [wt.HWND, ctypes.POINTER(wt.RECT)]
+        u32.GetLayeredWindowAttributes.argtypes = [
+            wt.HWND, ctypes.POINTER(wt.DWORD), ctypes.POINTER(ctypes.c_ubyte),
+            ctypes.POINTER(wt.DWORD)]
+        u32.GetCursorPos.argtypes = [ctypes.POINTER(wt.POINT)]
+        u32.GetAsyncKeyState.argtypes = [ctypes.c_int]
+        u32.GetAsyncKeyState.restype = ctypes.c_short
+        u32.SetWindowPos.argtypes = [wt.HWND, wt.HWND, ctypes.c_int, ctypes.c_int,
+                                     ctypes.c_int, ctypes.c_int, wt.UINT]
+        dwm.DwmGetWindowAttribute.argtypes = [wt.HWND, wt.DWORD, ctypes.c_void_p, wt.DWORD]
+        _DODGE_API = {'u32': u32, 'dwm': dwm, 'wt': wt, 'enum': enum}
+    except Exception as e:
+        wlog(f'DODGE  no window API: {e}')
+        _DODGE_API = False
+    return _DODGE_API or None
+
+
+_ROUND = None
+
+
+def round_region(hwnd, w, h, radius):
+    """Give a window corners of `radius` px, whatever Windows would give it.
+    Windows 11 rounds a window by a fixed few pixels; a region cut to the
+    window's size can be larger, and is made again whenever the size changes
+    (see Widget._round_root). Its edge is not smoothed, which at this radius,
+    on a window that is itself a soft panel, shows less than the corner being
+    small."""
+    global _ROUND
+    try:
+        if _ROUND is None:
+            from ctypes import wintypes as wt
+            gdi = ctypes.WinDLL('gdi32', use_last_error=True)
+            usr = ctypes.WinDLL('user32', use_last_error=True)
+            gdi.CreateRoundRectRgn.argtypes = [ctypes.c_int] * 6
+            gdi.CreateRoundRectRgn.restype = ctypes.c_void_p
+            usr.SetWindowRgn.argtypes = [wt.HWND, ctypes.c_void_p, wt.BOOL]
+            _ROUND = (gdi, usr)
+        gdi, usr = _ROUND
+        rgn = gdi.CreateRoundRectRgn(0, 0, int(w) + 1, int(h) + 1, int(radius) * 2, int(radius) * 2)
+        if rgn:
+            usr.SetWindowRgn(hwnd, rgn, True)       # the system owns the region from here
+            return True
+    except Exception:
+        pass
+    return False
+
+
+_RAISE = None
+
+
+def raise_topmost(hwnd):
+    """To the top of the topmost band, without moving, resizing or activating.
+
+    🔴 With the argument types declared. SetWindowPos was called through
+    ctypes.windll with none, so HWND_TOPMOST (-1) went in as a 32-bit int,
+    which is not the handle it stands for in a 64-bit process, and Windows
+    refused it, every time and without a word. The widget got above its menu
+    through Tk's own -topmost instead, and the menu never got back above the
+    widget: invisible while the menu opened beside the widget, plain once it
+    opened over it (2026-11-15)."""
+    global _RAISE
+    try:
+        if _RAISE is None:
+            from ctypes import wintypes as wt
+            f = ctypes.WinDLL('user32', use_last_error=True).SetWindowPos
+            f.argtypes = [wt.HWND, wt.HWND, ctypes.c_int, ctypes.c_int,
+                          ctypes.c_int, ctypes.c_int, wt.UINT]
+            f.restype = wt.BOOL
+            _RAISE = (f, wt.HWND)
+        f, HWND = _RAISE
+        return bool(f(hwnd, HWND(-1), 0, 0, 0, 0, 0x1 | 0x2 | 0x10))
+    except Exception:
+        return False
+
+
+_Z = None
+
+
+def z_blocked(hwnd, below=()):
+    """True when something stands above `hwnd` that should not: a visible
+    window of another process, or one of the handles in `below` (windows of
+    ours that must be under it). Windows of ours that are meant to be above it
+    (its menu, its dialogs, its tips) do not count.
+
+    🔴 The always-on-top loop runs every 10 ms and used to raise the widget and
+    then its menu, its flyout and its dialogs on every tick. Once the raise of
+    the menu worked (see raise_topmost) that was about 130 changes of the
+    window stack a second: on a frosted window each one is recomposed, and the
+    menu juddered. Now the stack is looked at (a few steps up from the window,
+    which is cheap) and changed only when it needs to be."""
+    global _Z
+    try:
+        if _Z is None:
+            from ctypes import wintypes as wt
+            u = ctypes.WinDLL('user32', use_last_error=True)
+            u.GetWindow.argtypes = [wt.HWND, wt.UINT]
+            u.GetWindow.restype = wt.HWND
+            u.IsWindowVisible.argtypes = [wt.HWND]
+            u.GetWindowThreadProcessId.argtypes = [wt.HWND, ctypes.POINTER(wt.DWORD)]
+            u.GetWindowRect.argtypes = [wt.HWND, ctypes.POINTER(wt.RECT)]
+            _Z = (u, wt)
+        u, wt = _Z
+        own = os.getpid()
+        pid = wt.DWORD()
+        mine, other = wt.RECT(), wt.RECT()
+        if not u.GetWindowRect(hwnd, ctypes.byref(mine)):
+            return True
+        below = set(below)
+        h = u.GetWindow(hwnd, 3)                    # GW_HWNDPREV: the one above
+        n = 0
+        while h and n < 300:
+            n += 1
+            if u.IsWindowVisible(h) and u.GetWindowRect(h, ctypes.byref(other)):
+                # Only a window that covers some of it can hide anything: the
+                # system keeps one-pixel helper windows above everything, for
+                # ever, and counting them made this always say "blocked".
+                if (min(mine.right, other.right) - max(mine.left, other.left) >= 8
+                        and min(mine.bottom, other.bottom) - max(mine.top, other.top) >= 8):
+                    if h in below:
+                        return True
+                    u.GetWindowThreadProcessId(h, ctypes.byref(pid))
+                    if pid.value != own:
+                        return True
+            h = u.GetWindow(h, 3)
+        return False
+    except Exception:
+        return True                                 # cannot tell: raise, as it always did
+
+
+def pointer_state():
+    """(x, y, button_down, ctrl_down) of the pointer now, or None."""
+    api = _dodge_api()
+    if not api:
+        return None
+    try:
+        pt = api['wt'].POINT()
+        if not api['u32'].GetCursorPos(ctypes.byref(pt)):
+            return None
+        key = api['u32'].GetAsyncKeyState
+        return (pt.x, pt.y,
+                any(key(k) & 0x8000 for k in (0x01, 0x02, 0x04)),
+                bool(key(0x11) & 0x8000))
+    except Exception:
+        return None
+
+
+def covering_level(x, y, w, h, own_pid=None, why=None):
+    """What the rectangle covers: 2 a window with content, 1 only the taskbar,
+    0 nothing (the desktop). The widget's own process is never counted. A
+    window without a title is a helper, an overlay or a placeholder, and there
+    is nothing in it to read; `why`, when given, collects (class, title) of the
+    window that made it 2."""
+    api = _dodge_api()
+    if not api:
+        return 0
+    wt, u32, dwm = api['wt'], api['u32'], api['dwm']
+    own_pid = own_pid or os.getpid()
+    level = [0]
+    buf = ctypes.create_unicode_buffer(256)
+    pid = wt.DWORD()
+    cloaked = ctypes.c_int()
+    rect = wt.RECT()
+
+    def visit(hwnd, _lparam):
+        try:
+            if not u32.IsWindowVisible(hwnd) or u32.IsIconic(hwnd):
+                return True
+            u32.GetClassNameW(hwnd, buf, 256)
+            cls = buf.value
+            if cls in _DESKTOP_CLASSES and cls not in _TASKBAR_CLASSES:
+                return True
+            u32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            if pid.value == own_pid:
+                return True
+            if (dwm.DwmGetWindowAttribute(hwnd, 14, ctypes.byref(cloaked), 4) == 0
+                    and cloaked.value):
+                return True                       # DWMWA_CLOAKED: not on screen
+            ex = u32.GetWindowLongW(hwnd, -20) & 0xFFFFFFFF
+            if ex & 0x20:                         # WS_EX_TRANSPARENT: click-through
+                return True
+            title = ''
+            if cls not in _TASKBAR_CLASSES:
+                tbuf = ctypes.create_unicode_buffer(128)
+                if u32.GetWindowTextW(hwnd, tbuf, 128) == 0:
+                    return True                   # untitled: nothing in it to read
+                title = tbuf.value
+            if ex & 0x80000:                      # layered: an invisible overlay?
+                key, flags, alpha = wt.DWORD(), wt.DWORD(), ctypes.c_ubyte()
+                if (u32.GetLayeredWindowAttributes(hwnd, ctypes.byref(key),
+                                                   ctypes.byref(alpha), ctypes.byref(flags))
+                        and flags.value & 2 and alpha.value < 24):
+                    return True
+            # DWMWA_EXTENDED_FRAME_BOUNDS: the window without its invisible
+            # resize border, which is not something that can be read.
+            if dwm.DwmGetWindowAttribute(hwnd, 9, ctypes.byref(rect), 16) != 0:
+                u32.GetWindowRect(hwnd, ctypes.byref(rect))
+            iw = min(rect.right, x + w) - max(rect.left, x)
+            ih = min(rect.bottom, y + h) - max(rect.top, y)
+            if iw >= 12 and ih >= 12:
+                if cls in _TASKBAR_CLASSES:
+                    level[0] = max(level[0], 1)
+                else:
+                    level[0] = 2
+                    if why is not None:
+                        why.append((cls, title[:40]))
+                    return False                  # nothing worse to find
+        except Exception:
+            pass
+        return True
+
+    try:
+        u32.EnumWindows(api['enum'](visit), 0)
+    except Exception as e:
+        wlog(f'DODGE  window enumeration failed: {e}')
+    return level[0]
+
+
+def dodge_plan(rect, pointer, velocity, mon, cost, zone, margin, min_shift,
+               home=None, reach=None):
+    """Where the widget should go, and so how far, when the pointer has stopped
+    on it.
+
+    What has to be uncovered is not the whole place the widget stands on but
+    what the pointer is about to read: a zone round the pointer (`zone`, its
+    half width and half height, and a `margin`). For each of the four
+    directions the smallest move that puts the widget clear of that zone is
+    worked out, which is short when the pointer is near an edge and long when
+    it is in the middle, and the direction is chosen by
+
+      how far it has to go,
+      what it would then cover (`cost(x, y)`: nothing, only the taskbar, a
+        window), and
+      which way the pointer was travelling (a move along it is a nudge out of
+        the way, a move against it puts the widget back in the pointer's path).
+
+    Never off the monitor `mon` (l, t, r, b), never further than `reach` from
+    `home` when the widget is already away (so repeated nudges cannot walk it
+    across the screen). None when no direction is possible."""
+    x, y, w, h = rect
+    px, py = pointer
+    vx, vy = velocity
+    zx, zy = zone
+    l, t, r, b = mon
+    speed = math.hypot(vx, vy)
+    ux, uy = (vx / speed, vy / speed) if speed > 180 else (0.0, 0.0)
+    rl, rt, rr, rb = px - zx - margin, py - zy - margin, px + zx + margin, py + zy + margin
+    options = (('up', 0, -1, x, min(rt - h, y - min_shift)),
+               ('down', 0, 1, x, max(rb, y + min_shift)),
+               ('left', -1, 0, min(rl - w, x - min_shift), y),
+               ('right', 1, 0, max(rr, x + min_shift), y))
+    best = None
+    for name, dx, dy, nx, ny in options:
+        nx, ny = int(round(nx)), int(round(ny))
+        if nx < l or ny < t or nx + w > r or ny + h > b:
+            continue
+        if home is not None and reach is not None and math.hypot(nx - home[0], ny - home[1]) > reach:
+            continue
+        dist = math.hypot(nx - x, ny - y)
+        align = dx * ux + dy * uy                    # 1: with the pointer, -1: against it
+        factor = 1.0 - 0.35 * align if align > 0 else 1.0 - 0.5 * align
+        score = dist * factor + 0.5 * cost(nx, ny)
+        if best is None or score < best[0]:
+            best = (score, nx, ny)
+    return (best[1], best[2]) if best else None
+
+
+def _timer_resolution(on):
+    """Ask Windows for a 1 ms timer while something is sliding: Tk's timers
+    run at about 15 ms otherwise, and a slide made of them is not smooth."""
+    try:
+        winmm = ctypes.windll.winmm
+        (winmm.timeBeginPeriod if on else winmm.timeEndPeriod)(1)
+    except Exception:
+        pass
+
+
+def _ease(k):
+    """Slow at both ends: what makes a slide read as one movement."""
+    return 4 * k ** 3 if k < 0.5 else 1 - (-2 * k + 2) ** 3 / 2
+
+
+# ═══════════════════════════════════════════════════════
+# The notification-area icon
+# ═══════════════════════════════════════════════════════
+
+class TrayIcon:
+    """An icon in the notification area: a click on it is `on_click`, a
+    right-click `on_menu`. Plain Win32 through ctypes, like the rest. It lives
+    on the Tk thread, whose loop delivers its messages, and it is added again
+    when Explorer restarts (the taskbar forgets its icons then).
+
+    🔴 The window procedure runs INSIDE Tk's own event loop (Windows delivers
+    the message while Tcl is in DoOneEvent), and it must not touch Tkinter:
+    _tkinter keeps the interpreter's thread state in one global that every
+    call into Tcl clears on the way out, so a call from here left it empty for
+    the scheduled handler that followed, which aborted the whole process
+    ("PyEval_RestoreThread: the GIL is released": a click on the icon closed
+    the widget, 2026-11-15). It only queues what happened; drain(), called from
+    a timer of the Tk loop, does the rest."""
+
+    WM_TRAY = 0x8000 + 1                     # WM_APP + 1
+
+    def __init__(self, root, icon_on, icon_off, on_click, on_menu):
+        from ctypes import wintypes as wt
+        self._wt = wt
+        self._root = root
+        self._on_click, self._on_menu = on_click, on_menu
+        self.events = collections.deque()      # what the window procedure saw
+        self._added = False
+        self._u32 = ctypes.WinDLL('user32', use_last_error=True)
+        self._sh = ctypes.WinDLL('shell32', use_last_error=True)
+        u32 = self._u32
+        LRESULT = ctypes.c_ssize_t
+        self._proc_t = ctypes.WINFUNCTYPE(LRESULT, wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM)
+        u32.DefWindowProcW.argtypes = [wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM]
+        u32.DefWindowProcW.restype = LRESULT
+        u32.CreateWindowExW.restype = wt.HWND
+        u32.CreateWindowExW.argtypes = [wt.DWORD, wt.LPCWSTR, wt.LPCWSTR, wt.DWORD,
+                                        ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                        ctypes.c_int, wt.HWND, wt.HMENU, wt.HINSTANCE,
+                                        wt.LPVOID]
+        u32.LoadImageW.restype = wt.HANDLE
+        u32.LoadImageW.argtypes = [wt.HINSTANCE, wt.LPCWSTR, wt.UINT, ctypes.c_int,
+                                   ctypes.c_int, wt.UINT]
+        u32.AppendMenuW.argtypes = [wt.HMENU, wt.UINT, ctypes.c_size_t, wt.LPCWSTR]
+        u32.CreatePopupMenu.restype = wt.HMENU
+        u32.DestroyMenu.argtypes = [wt.HMENU]
+        u32.TrackPopupMenu.argtypes = [wt.HMENU, wt.UINT, ctypes.c_int, ctypes.c_int,
+                                       ctypes.c_int, wt.HWND, wt.LPVOID]
+        u32.SetForegroundWindow.argtypes = [wt.HWND]
+        u32.PostMessageW.argtypes = [wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM]
+        u32.DestroyIcon.argtypes = [wt.HANDLE]
+        u32.DestroyWindow.argtypes = [wt.HWND]
+
+        class WNDCLASSW(ctypes.Structure):
+            _fields_ = [('style', wt.UINT), ('lpfnWndProc', self._proc_t),
+                        ('cbClsExtra', ctypes.c_int), ('cbWndExtra', ctypes.c_int),
+                        ('hInstance', wt.HINSTANCE), ('hIcon', wt.HANDLE),
+                        ('hCursor', wt.HANDLE), ('hbrBackground', wt.HANDLE),
+                        ('lpszMenuName', wt.LPCWSTR), ('lpszClassName', wt.LPCWSTR)]
+
+        class NOTIFYICONDATAW(ctypes.Structure):
+            _fields_ = [('cbSize', wt.DWORD), ('hWnd', wt.HWND), ('uID', wt.UINT),
+                        ('uFlags', wt.UINT), ('uCallbackMessage', wt.UINT),
+                        ('hIcon', wt.HANDLE), ('szTip', ctypes.c_wchar * 128),
+                        ('dwState', wt.DWORD), ('dwStateMask', wt.DWORD),
+                        ('szInfo', ctypes.c_wchar * 256), ('uVersion', wt.UINT),
+                        ('szInfoTitle', ctypes.c_wchar * 64), ('dwInfoFlags', wt.DWORD),
+                        ('guidItem', ctypes.c_ubyte * 16), ('hBalloonIcon', wt.HANDLE)]
+
+        self._NID = NOTIFYICONDATAW
+        self._sh.Shell_NotifyIconW.argtypes = [wt.DWORD, ctypes.POINTER(NOTIFYICONDATAW)]
+        self._sh.Shell_NotifyIconW.restype = wt.BOOL
+        size = ctypes.windll.user32.GetSystemMetrics(49) or 16      # SM_CXSMICON
+        self._icons = {}
+        for key, path in (('on', icon_on), ('off', icon_off)):
+            h = u32.LoadImageW(None, path, 1, size, size, 0x10)      # IMAGE_ICON, from file
+            if not h:
+                raise OSError(f'tray icon {path} could not be loaded')
+            self._icons[key] = h
+        self._created_msg = u32.RegisterWindowMessageW('TaskbarCreated')
+        self._proc = self._proc_t(self._wndproc)       # kept: a collected callback crashes
+        hinst = ctypes.windll.kernel32.GetModuleHandleW(None)
+        self._cls = 'ClaudeUsageTray'
+        wc = WNDCLASSW()
+        wc.lpfnWndProc = self._proc
+        wc.hInstance = hinst
+        wc.lpszClassName = self._cls
+        u32.RegisterClassW.argtypes = [ctypes.POINTER(WNDCLASSW)]
+        u32.RegisterClassW(ctypes.byref(wc))
+        self.hwnd = u32.CreateWindowExW(0x80, self._cls, 'Claude Usage tray', 0,
+                                        0, 0, 0, 0, None, None, hinst, None)
+        if not self.hwnd:
+            raise OSError('the tray window could not be created')
+        self._state, self._tip = 'on', ''
+
+    def _wndproc(self, hwnd, msg, wparam, lparam):
+        try:
+            if msg == self.WM_TRAY:
+                ev = lparam & 0xFFFF
+                if ev == 0x202:                        # WM_LBUTTONUP
+                    self.events.append('click')
+                elif ev == 0x205:                      # WM_RBUTTONUP
+                    self.events.append('menu')
+            elif msg == self._created_msg:
+                self.events.append('recreate')
+        except Exception:
+            pass
+        return self._u32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+    def drain(self):
+        """Act on what the window procedure queued. From the Tk thread, from a
+        timer: never from the window procedure itself (see the class note)."""
+        while self.events:
+            ev = self.events.popleft()
+            try:
+                if ev == 'click':
+                    self._on_click()
+                elif ev == 'menu':
+                    self._on_menu()
+                elif ev == 'recreate':
+                    self._added = False
+                    self._refresh_icon()
+            except tk.TclError:
+                raise
+            except Exception as e:
+                wlog(f'TRAY   {ev} failed: {e}')
+
+    def _data(self):
+        nid = self._NID()
+        nid.cbSize = ctypes.sizeof(self._NID)
+        nid.hWnd = self.hwnd
+        nid.uID = 1
+        nid.uFlags = 0x1 | 0x2 | 0x4                   # message, icon, tip
+        nid.uCallbackMessage = self.WM_TRAY
+        nid.hIcon = self._icons[self._state]
+        nid.szTip = self._tip[:127]
+        return nid
+
+    def _refresh_icon(self):
+        nid = self._data()
+        ok = self._sh.Shell_NotifyIconW(1 if self._added else 0, ctypes.byref(nid))
+        if ok:
+            self._added = True
+        return ok
+
+    def show(self, state, tip):
+        """Add the icon, or change it: state 'on' or 'off', and its hover text."""
+        self._state, self._tip = state, tip
+        return self._refresh_icon()
+
+    def popup(self, items):
+        """A menu at the pointer. `items`: (id, text, checked) or None for a
+        separator. Returns the id chosen, or 0."""
+        u32, wt = self._u32, self._wt
+        menu = u32.CreatePopupMenu()
+        try:
+            for it in items:
+                if it is None:
+                    u32.AppendMenuW(menu, 0x800, 0, None)          # MF_SEPARATOR
+                else:
+                    u32.AppendMenuW(menu, 0x8 if it[2] else 0, it[0], it[1])   # MF_CHECKED
+            pt = wt.POINT()
+            u32.GetCursorPos(ctypes.byref(pt))
+            u32.SetForegroundWindow(self.hwnd)     # or the menu would not close on a click away
+            cmd = u32.TrackPopupMenu(menu, 0x100 | 0x20 | 0x2 | 0x80,   # return, no notify, right button, bottom
+                                     pt.x, pt.y, 0, self.hwnd, None)
+            u32.PostMessageW(self.hwnd, 0, 0, 0)
+            return cmd
+        finally:
+            u32.DestroyMenu(menu)
+
+    def close(self):
+        """Take the icon away. Safe to call twice."""
+        try:
+            if self._added:
+                self._sh.Shell_NotifyIconW(2, ctypes.byref(self._data()))
+                self._added = False
+            if self.hwnd:
+                self._u32.DestroyWindow(self.hwnd)
+                self.hwnd = None
+            for h in self._icons.values():
+                self._u32.DestroyIcon(h)
+            self._icons = {}
+        except Exception:
+            pass
+
+
+def sheen_image(w, h, radius, dark):
+    """The light that lies on the glass: a soft pane over the top of it, a
+    bright edge that fades towards the bottom, and a faint shade at the foot,
+    as RGBA at the size of the widget (transparent everywhere else)."""
+    SS = 2
+    W, H, R = w * SS, h * SS, radius * SS
+
+    def rr(inset):
+        m = Image.new('L', (W, H), 0)
+        ImageDraw.Draw(m).rounded_rectangle((inset, inset, W - 1 - inset, H - 1 - inset),
+                                            radius=max(1, R - inset), fill=255)
+        return m
+
+    outer, inner = rr(0), rr(3 * SS)
+    # the pane: bright at the top, gone by half way down
+    pane_h = int(H * 0.5)
+    fade = Image.linear_gradient('L').rotate(180).resize((W, pane_h))
+    pane = Image.new('L', (W, H), 0)
+    pane.paste(fade.point(lambda v: int(v * (0.13 if dark else 0.42))), (0, 0))
+    pane = ImageChops.multiply(pane, inner)
+    # the edge: a line of light round the whole, strongest at the top
+    ring = ImageChops.subtract(outer, inner)
+    edge_fade = Image.linear_gradient('L').rotate(180).resize((W, H)).point(lambda v: 40 + int(v * 0.75))
+    ring = ImageChops.multiply(ring, edge_fade).point(lambda v: int(v * (0.34 if dark else 0.9)))
+    # the foot: a little shade, for depth
+    foot_h = int(H * 0.22)
+    shade = Image.new('L', (W, H), 0)
+    shade.paste(Image.linear_gradient('L').resize((W, foot_h)).point(lambda v: int(v * (0.16 if dark else 0.07))),
+                (0, H - foot_h))
+    shade = ImageChops.multiply(shade, outer)
+    white = Image.new('RGBA', (W, H), (255, 255, 255, 0))
+    white.putalpha(pane)                      # no bright rim: it read as a white border
+    black = Image.new('RGBA', (W, H), (0, 0, 0, 0))
+    black.putalpha(shade)
+    return Image.alpha_composite(black, white).resize((w, h), Image.LANCZOS)
+
+
+class Sheen:
+    """A click-through window above the widget, carrying sheen_image.
+
+    Its own window and not something painted into the widget: Tk paints every
+    pixel opaque, so a highlight over the panel and its bars cannot be drawn
+    from inside it. A layered window with a per-pixel alpha bitmap is the one
+    thing that gives light that lies over what is under it, and it is valid
+    where the other trick (see FROST) is not: it shows on an HDR display. It
+    takes no click (WS_EX_TRANSPARENT), has no taskbar button and is never
+    activated. Nothing here touches Tk: it is told where to be."""
+
+    def __init__(self):
+        from ctypes import wintypes as wt
+        self._wt = wt
+        self.hwnd = None
+        self.shown = False
+        self._key = None
+        self._pos = None
+        self._bmp = self._dc = self._old = None
+        u = self._u = ctypes.WinDLL('user32', use_last_error=True)
+        g = self._g = ctypes.WinDLL('gdi32', use_last_error=True)
+        u.CreateWindowExW.restype = wt.HWND
+        u.CreateWindowExW.argtypes = [wt.DWORD, wt.LPCWSTR, wt.LPCWSTR, wt.DWORD, ctypes.c_int,
+                                      ctypes.c_int, ctypes.c_int, ctypes.c_int, wt.HWND, wt.HMENU,
+                                      wt.HINSTANCE, wt.LPVOID]
+        u.DefWindowProcW.argtypes = [wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM]
+        u.DefWindowProcW.restype = ctypes.c_ssize_t
+        u.ShowWindow.argtypes = [wt.HWND, ctypes.c_int]
+        u.DestroyWindow.argtypes = [wt.HWND]
+        u.GetDC.argtypes = [wt.HWND]
+        u.GetDC.restype = wt.HDC
+        u.ReleaseDC.argtypes = [wt.HWND, wt.HDC]
+        u.SetWindowPos.argtypes = [wt.HWND, wt.HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                   ctypes.c_int, wt.UINT]
+        g.CreateCompatibleDC.argtypes = [wt.HDC]
+        g.CreateCompatibleDC.restype = wt.HDC
+        g.CreateDIBSection.argtypes = [wt.HDC, ctypes.c_void_p, wt.UINT, ctypes.POINTER(ctypes.c_void_p),
+                                       wt.HANDLE, wt.DWORD]
+        g.CreateDIBSection.restype = wt.HBITMAP
+        g.SelectObject.argtypes = [wt.HDC, wt.HGDIOBJ]
+        g.SelectObject.restype = wt.HGDIOBJ
+        g.DeleteObject.argtypes = [wt.HGDIOBJ]
+        g.DeleteDC.argtypes = [wt.HDC]
+
+        class POINT(ctypes.Structure):
+            _fields_ = [('x', ctypes.c_long), ('y', ctypes.c_long)]
+
+        class SIZE(ctypes.Structure):
+            _fields_ = [('cx', ctypes.c_long), ('cy', ctypes.c_long)]
+
+        class BLEND(ctypes.Structure):
+            _fields_ = [('op', ctypes.c_ubyte), ('flags', ctypes.c_ubyte),
+                        ('alpha', ctypes.c_ubyte), ('fmt', ctypes.c_ubyte)]
+
+        class BIH(ctypes.Structure):
+            _fields_ = [('size', ctypes.c_uint32), ('w', ctypes.c_int32), ('h', ctypes.c_int32),
+                        ('planes', ctypes.c_uint16), ('bits', ctypes.c_uint16), ('comp', ctypes.c_uint32),
+                        ('img', ctypes.c_uint32), ('xp', ctypes.c_int32), ('yp', ctypes.c_int32),
+                        ('used', ctypes.c_uint32), ('imp', ctypes.c_uint32)]
+
+        self._POINT, self._SIZE, self._BLEND, self._BIH = POINT, SIZE, BLEND, BIH
+        u.UpdateLayeredWindow.argtypes = [wt.HWND, wt.HDC, ctypes.POINTER(POINT), ctypes.POINTER(SIZE),
+                                          wt.HDC, ctypes.POINTER(POINT), wt.COLORREF,
+                                          ctypes.POINTER(BLEND), wt.DWORD]
+        self._proc_t = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM)
+        self._proc = self._proc_t(lambda h, m, wp, lp: u.DefWindowProcW(h, m, wp, lp))   # kept alive
+
+        class WNDCLASSW(ctypes.Structure):
+            _fields_ = [('style', wt.UINT), ('lpfnWndProc', self._proc_t), ('cbClsExtra', ctypes.c_int),
+                        ('cbWndExtra', ctypes.c_int), ('hInstance', wt.HINSTANCE), ('hIcon', wt.HANDLE),
+                        ('hCursor', wt.HANDLE), ('hbrBackground', wt.HANDLE), ('lpszMenuName', wt.LPCWSTR),
+                        ('lpszClassName', wt.LPCWSTR)]
+
+        hinst = ctypes.windll.kernel32.GetModuleHandleW(None)
+        wc = WNDCLASSW()
+        wc.lpfnWndProc = self._proc
+        wc.hInstance = hinst
+        wc.lpszClassName = 'ClaudeUsageSheen'
+        u.RegisterClassW.argtypes = [ctypes.POINTER(WNDCLASSW)]
+        u.RegisterClassW(ctypes.byref(wc))
+        # layered | transparent (no click) | tool window | no activate | topmost; a popup
+        self.hwnd = u.CreateWindowExW(0x80000 | 0x20 | 0x80 | 0x8000000 | 0x8, 'ClaudeUsageSheen', '',
+                                      0x80000000, 0, 0, 1, 1, None, None, hinst, None)
+        if not self.hwnd:
+            raise OSError('the sheen window could not be created')
+
+    def _image(self, w, h, radius, dark):
+        return sheen_image(w, h, radius, dark)
+
+    def _paint(self, x, y, w, h, radius, dark):
+        wt, u, g = self._wt, self._u, self._g
+        img = self._image(w, h, radius, dark).convert('RGBa')
+        data = img.tobytes('raw', 'BGRa')
+        screen = u.GetDC(None)
+        try:
+            if self._dc is None:
+                self._dc = g.CreateCompatibleDC(screen)
+            bmi = self._BIH(ctypes.sizeof(self._BIH), w, -h, 1, 32, 0, 0, 0, 0, 0, 0)
+            bits = ctypes.c_void_p()
+            bmp = g.CreateDIBSection(screen, ctypes.byref(bmi), 0, ctypes.byref(bits), None, 0)
+            if not bmp:
+                raise OSError('no bitmap for the sheen')
+            ctypes.memmove(bits, data, len(data))
+            old = g.SelectObject(self._dc, bmp)
+            if self._bmp is not None:
+                g.DeleteObject(self._bmp)
+            self._bmp = bmp
+            u.UpdateLayeredWindow(self.hwnd, screen, ctypes.byref(self._POINT(x, y)),
+                                  ctypes.byref(self._SIZE(w, h)), self._dc, ctypes.byref(self._POINT(0, 0)),
+                                  0, ctypes.byref(self._BLEND(0, 0, 255, 1)), 2)      # ULW_ALPHA, AC_SRC_ALPHA
+        finally:
+            u.ReleaseDC(None, screen)
+
+    def update(self, x, y, w, h, radius, dark, visible, under=None):
+        u = self._u
+        if not visible or w < 20 or h < 20:
+            if self.shown:
+                u.ShowWindow(self.hwnd, 0)
+                self.shown = False
+            return
+        key = (w, h, radius, dark)
+        if key != self._key:
+            self._paint(x, y, w, h, radius, dark)
+            self._key, self._pos = key, (x, y)
+        elif (x, y) != self._pos:
+            u.SetWindowPos(self.hwnd, None, x, y, 0, 0, 0x1 | 0x4 | 0x10)    # NOSIZE | NOZORDER | NOACTIVATE
+            self._pos = (x, y)
+        if not self.shown:
+            u.ShowWindow(self.hwnd, 4)                                       # SW_SHOWNOACTIVATE
+            if under:
+                self.stack_under(under)
+            else:
+                raise_topmost(self.hwnd)
+            self.shown = True
+
+    def stack_under(self, widget_hwnd):
+        """Directly below `widget_hwnd`, topmost like it."""
+        self._u.SetWindowPos(self.hwnd, widget_hwnd, 0, 0, 0, 0, 0x1 | 0x2 | 0x10)   # NOSIZE|NOMOVE|NOACTIVATE
+
+    def close(self):
+        try:
+            if self.hwnd:
+                self._u.DestroyWindow(self.hwnd)
+                self.hwnd = None
+            if self._bmp is not None:
+                self._g.DeleteObject(self._bmp)
+                self._bmp = None
+            if self._dc is not None:
+                self._g.DeleteDC(self._dc)
+                self._dc = None
+        except Exception:
+            pass
+
+
+FROST_TINT_RGBA = (14, 16, 22, 196)
+
+
+def tint_image(w, h, radius):
+    """The dark of the frost: the widget's shape in a deep, cool black that is
+    part transparent. It lies UNDER the widget, so that the blur behind the
+    widget takes it up with whatever else is there: the frost is dark whatever
+    the wallpaper, and the text stays readable on a white window."""
+    SS = 2
+    m = Image.new('L', (w * SS, h * SS), 0)
+    ImageDraw.Draw(m).rounded_rectangle((0, 0, w * SS - 1, h * SS - 1), radius=radius * SS, fill=255)
+    m = m.resize((w, h), Image.LANCZOS)
+    out = Image.new('RGBA', (w, h), FROST_TINT_RGBA[:3] + (0,))
+    out.putalpha(m.point(lambda v: v * FROST_TINT_RGBA[3] // 255))
+    return out
+
+
+class Tint(Sheen):
+    """The frost's dark, as a click-through window directly under the widget
+    (see tint_image). Same machinery as the sheen."""
+
+    def __init__(self):
+        super().__init__()
+        self.under = None
+
+    def _image(self, w, h, radius, dark):
+        return tint_image(w, h, radius)
+
+
+def make_tray_icons(src_path, folder):
+    """The two icon files the tray shows, written beside the config: the
+    product's icon, and the same one greyed with a slash through it."""
+    base = Image.open(src_path).convert('RGBA').resize((64, 64), Image.LANCZOS)
+    on = os.path.join(folder, 'tray-on.ico')
+    off = os.path.join(folder, 'tray-off.ico')
+    base.save(on, sizes=[(16, 16), (24, 24), (32, 32), (48, 48)])
+    grey = Image.merge('RGBA', (*[base.convert('L').point(lambda v: int(v * 0.55) + 40)] * 3,
+                                base.getchannel('A')))
+    d = ImageDraw.Draw(grey)
+    d.line((10, 54, 54, 10), fill=(232, 88, 88, 255), width=7)
+    grey.save(off, sizes=[(16, 16), (24, 24), (32, 32), (48, 48)])
+    return on, off
 
 
 # ═══════════════════════════════════════════════════════
@@ -5503,6 +7139,27 @@ class Widget:
         # The theme decides the colour of every widget about to be created,
         # so it goes first: Tk has no way to repaint one afterwards.
         apply_theme(self.cfg.get('theme', 'dark'))
+        # The size, for the same reason, and before the fonts: saved widths
+        # are carried over to it first.
+        _scale = scale_setting(self.cfg)
+        if self.cfg.get('layout_rev', 0) < 3:
+            # The layout grew (2026-11-15): widths saved for the old one would
+            # hold the new one at its old, narrow size. Position is kept.
+            for key in ('width', 'height', 'ess_width'):
+                self.cfg.pop(key, None)
+            self.cfg['layout_rev'] = 3
+            save_cfg(self.cfg)
+        if migrate_scale(self.cfg, _scale):
+            save_cfg(self.cfg)
+        apply_appearance(self.cfg.get('appearance', 'frost'),
+                         where=(self.cfg.get('x', 100), self.cfg.get('y', 100),
+                                self.cfg.get('width', 400), self.cfg.get('height', 250)))
+        self._frost_started_as = FROST
+        self._frost_mismatch = 0
+        if FROST_HDR_SKIPPED:
+            wlog('FROST  not used: this display is in HDR, where the look cannot be drawn '
+                 '(the opaque glass is used; turning HDR off for it, Win+Alt+B, gives the frost)')
+        apply_scale(_scale)
         # Load language from config, default English
         set_lang(self.cfg.get('language', 'en'))
         # And what the line under the bars carries, for the same reason: the
@@ -5549,6 +7206,20 @@ class Widget:
         self._last_width = 0          # last width seen, to skip idle <Configure>
         self._fetch_busy = False      # a fetch is in flight; do not start another
         self._fetch_pending = False   # a refresh asked for while one was running
+        self._last_fetch_t = 0.0      # when the last fetch started (monotonic)
+        self._activity_job = None     # a refresh waiting on Claude Code activity
+        self._dodge_home = None       # its place, while it is out of the way (see _home_xy)
+        self._dodge_job = self._dodge_glide = None
+        self._dodge_dwell = self._dodge_gone = None
+        self._dodge_confirm = None
+        self._dodge_next_check = 0.0
+        self._ptr_hist = collections.deque(maxlen=24)   # (time, x, y) of the pointer, lately
+        self._timer_hi = False
+        self._tray = None
+        self._glass_result, self._glass_busy, self._glass_last = None, False, 0.0
+        self._handoff = os.environ.pop('CLAUDE_USAGE_HANDOFF', None)   # started by a restart: fade in
+        self._handoff_data = os.environ.pop('CLAUDE_USAGE_HANDOFF_DATA', None)
+        self._alpha_hold = bool(self._handoff)    # the fade owns the window's alpha until it is done
         self._fetch_lock = threading.Lock()   # guards the two flags above
         self._topmost_job = None
         self._pulse_job = None
@@ -5581,7 +7252,7 @@ class Widget:
         self.root.title('Claude Usage')
         self.root.overrideredirect(True)
         self.root.attributes('-topmost', True)
-        self.root.attributes('-alpha', 0.94)
+        self.root.attributes('-alpha', 0.0 if self._handoff else rest_alpha())
         self.root.configure(bg=BG)
 
         try:
@@ -5682,6 +7353,7 @@ class Widget:
         self.root.minsize(MIN_W, 0)
 
         self.root.after(50, lambda: dwm_round(self.root, shadow=False))
+        self.root.after(70, self._apply_glass)
         # Topmost recovery, three layers, all running on the Tk thread:
         #  1. WS_EX_NOACTIVATE on the window itself - eliminates the
         #     worst-case taskbar flash (focus transfer from widget to
@@ -5704,6 +7376,10 @@ class Widget:
             self._update_expand_visibility()
             self._auto_height()
 
+        if self._handoff:
+            self.root.after(120, self._handoff_begin)
+        elif has_credentials(self.cfg):
+            self.root.after(60, self._show_remembered_reading)
         if has_credentials(self.cfg):
             self.refresh()
             self._schedule()
@@ -5718,11 +7394,20 @@ class Widget:
         self._update_banner = None
         self._schedule_update_check()
 
+        # Live view: the reset text follows the clock between fetches, and
+        # Claude Code's own activity asks for a fresh reading.
+        self.root.after(LIVE_TICK_MS, self._live_tick)
+        self._start_activity_watch()
+        self._dodge_start()
+        self.root.after(1200 if self._handoff else 600, self._start_tray)
+
         # Pre-warm the slow paths that the first menu open would trigger on
         # a cold start: a Toplevel creation + Segoe UI Emoji font lookup.
         # Without this, the first right-click takes 3-5s while Tk and
         # Windows lazily initialize both; subsequent opens are instant.
-        self.root.after(200, self._prewarm_menu)
+        # Not while a restart's fade is in progress: it is slow, and the fade
+        # would wait for it.
+        self.root.after(1600 if self._handoff else 200, self._prewarm_menu)
 
         # Self-heal on live monitor changes: bring the widget home when its
         # monitor is re-added, or rescue it onto the primary if it vanished.
@@ -5760,7 +7445,7 @@ class Widget:
         if self._bar_icon:
             ico = tk.Label(self.tb, image=self._bar_icon, bg=BG_TITLE, padx=4)
         else:
-            ico = tk.Label(self.tb, text=' \u2731', font=('Segoe UI', 11),
+            ico = tk.Label(self.tb, text=' \u2731', font=('Segoe UI', sz(11)),
                            fg=CLAUDE_TEXT, bg=BG_TITLE)
         ico.pack(side='left', padx=(6, 0))
         ico.bind('<Button-1>', self._drag_start)
@@ -5774,15 +7459,16 @@ class Widget:
         title.bind('<ButtonRelease-1>', self._save_geometry_user)
 
         # Close (rightmost)
-        self.btn_x = tk.Label(self.tb, text=' \u2715 ', font=FT_EMOJI,
+        self.btn_x = tk.Label(self.tb, text=' \u2715 ', font=FT_EMOJI_W,
                               fg=DIM, bg=BG_TITLE, cursor='hand2')
         self.btn_x.pack(side='right', padx=(0, 2))
         self.btn_x.bind('<Button-1>', lambda e: self._quit())
         self.btn_x.bind('<Enter>', lambda e: self.btn_x.config(fg=RED, bg=HOVER_BG))
-        self.btn_x.bind('<Leave>', lambda e: self.btn_x.config(fg=DIM, bg=BG_TITLE))
+        self.btn_x.bind('<Leave>', lambda e: self.btn_x.config(
+            fg=DIM, bg=getattr(self, '_title_bg', BG_TITLE)))
 
         # Hamburger menu
-        self.btn_menu = tk.Label(self.tb, text=' \u2261 ', font=('Segoe UI', 12),
+        self.btn_menu = tk.Label(self.tb, text=' \u2261 ', font=('Segoe UI', sz(12)),
                                  fg=DIM, bg=BG_TITLE, cursor='hand2')
         self.btn_menu.pack(side='right')
         self.btn_menu.bind('<Button-1>', self._show_menu)
@@ -5803,7 +7489,7 @@ class Widget:
 
         # Refresh button - Segoe MDL2 refresh glyph at a compact size so it
         # matches the original ↻ footprint without the thin-arrow look.
-        self.btn_r = tk.Label(self.tb, text=f' {ICON_REFRESH} ', font=FT_MDL2_TB,
+        self.btn_r = tk.Label(self.tb, text=f' {ICON_REFRESH} ', font=FT_MDL2_W,
                               fg=DIM, bg=BG_TITLE, cursor='hand2')
         self.btn_r.pack(side='right')
         self.btn_r.bind('<Button-1>', lambda e: self.refresh())
@@ -5812,7 +7498,11 @@ class Widget:
 
         # Last update time
         self.lbl_time = tk.Label(self.tb, text='', font=FT_S, fg=FG, bg=BG_TITLE)
-        self.lbl_time.pack(side='right', padx=(0, 2))
+        if not GLASS:
+            # The glass looks show the time of the last reading beside the
+            # session's name, which is the one worth knowing; a second clock
+            # of the same minute beside the buttons said nothing more.
+            self.lbl_time.pack(side='right', padx=(0, 2))
         self.lbl_time.bind('<Button-1>', self._drag_start)
         self.lbl_time.bind('<B1-Motion>', self._drag_move)
         self.lbl_time.bind('<ButtonRelease-1>', self._save_geometry_user)
@@ -5877,9 +7567,17 @@ class Widget:
             sec.cv.bind('<Button-1>', lambda e, s=sec: self._bar_clicked(s), add='+')
 
         # Apply the saved palette mode to every bar now that they all exist.
-        if self.cfg.get('bar_dynamic', False):
+        if self.cfg.get('bar_dynamic', GLASS):
             for sec in self._all_sections():
                 sec._dynamic = True
+        # How long each limit's window is, for the pace its colour follows.
+        for sec, secs in ((self.s_session, 5 * 3600), (self.s_weekly, 7 * 86400),
+                          (self.s_sonnet, 7 * 86400)):
+            sec._window_s = secs
+        for code, sec in self.ess_bars.items():
+            sec._window_s = 5 * 3600 if code == 'session' else 7 * 86400
+        if self.cfg.get('robot', GLASS):
+            self.s_session.enable_robot()
         self._apply_split()
 
         # Hamburger menu pill - shown on the right of the side-by-side strip
@@ -5898,16 +7596,16 @@ class Widget:
         self.ess_menu.pack_forget()
 
         # Bottom spacer
-        self.bottom_pad = tk.Frame(self.content, bg=BG, height=6)
+        self.bottom_pad = tk.Frame(self.content, bg=BG, height=BOTTOM_PAD)
         self.bottom_pad.pack(fill='x')
 
         # ── Overlay elements (place() on main - always at window corners) ──
 
         # Expand dot - bottom-left
-        self.btn_expand = tk.Label(self.main, text='\u25cf', font=FT_DOT,
+        self.btn_expand = tk.Label(self.main, text='\u25cf', font=FT_DOT_W,
                                    fg=DOT_W_D, bg=BG, cursor='hand2',
                                    bd=0, highlightthickness=0, padx=0, pady=0)
-        self.btn_expand.place(x=6, rely=1.0, y=-4, anchor='sw')
+        self.btn_expand.place(x=DOT_X, rely=1.0, y=-DOT_Y, anchor='sw')
         self.btn_expand.bind('<Button-1>', lambda e: self._toggle_expand())
         self.btn_expand.bind('<Enter>', lambda e: self.btn_expand.config(fg=DOT_W_H))
         self.btn_expand.bind('<Leave>', lambda e: self.btn_expand.config(
@@ -5920,10 +7618,10 @@ class Widget:
                       delay=500, persistent=True)
 
         # Resize dot - bottom-right (ALWAYS stays here)
-        self.btn_resize = tk.Label(self.main, text='\u25cf', font=FT_DOT,
+        self.btn_resize = tk.Label(self.main, text='\u25cf', font=FT_DOT_W,
                                    fg=OCHRE, bg=BG, cursor='hand2',
                                    bd=0, highlightthickness=0, padx=0, pady=0)
-        self.btn_resize.place(relx=1.0, x=-6, rely=1.0, y=-4, anchor='se')
+        self.btn_resize.place(relx=1.0, x=-DOT_X, rely=1.0, y=-DOT_Y, anchor='se')
         self.btn_resize.bind('<Button-1>', self._resize_start)
         self.btn_resize.bind('<B1-Motion>', self._resize_move)
         self.btn_resize.bind('<ButtonRelease-1>', self._save_geometry_resize)
@@ -5940,14 +7638,14 @@ class Widget:
         # Essential mode controls - dynamic stack, right-aligned
         # Visual order left to right: ✕ ↻ HH:MM [resize dot]
         self.ess_bar = tk.Frame(self.main, bg=BG)
-        self.ess_close = tk.Label(self.ess_bar, text='\u2715', font=FT_EMOJI,
+        self.ess_close = tk.Label(self.ess_bar, text='\u2715', font=FT_EMOJI_W,
                                   fg=DIM, bg=BG, cursor='hand2',
                                   bd=0, highlightthickness=0, padx=4, pady=0)
         self.ess_close.pack(side='left')
         self.ess_close.bind('<Button-1>', lambda e: self._quit())
         self.ess_close.bind('<Enter>', lambda e: self.ess_close.config(fg=RED))
         self.ess_close.bind('<Leave>', lambda e: self.ess_close.config(fg=DIM))
-        self.ess_refresh = tk.Label(self.ess_bar, text=ICON_REFRESH, font=FT_MDL2_TB,
+        self.ess_refresh = tk.Label(self.ess_bar, text=ICON_REFRESH, font=FT_MDL2_W,
                                     fg=DIM, bg=BG, cursor='hand2',
                                     bd=0, highlightthickness=0, padx=2, pady=0)
         self.ess_refresh.pack(side='left')
@@ -5956,7 +7654,8 @@ class Widget:
         self.ess_refresh.bind('<Leave>', lambda e: self.ess_refresh.config(fg=DIM))
         self.ess_time = tk.Label(self.ess_bar, text='', font=FT_S, fg=FG, bg=BG,
                                  bd=0, highlightthickness=0, padx=4, pady=0)
-        self.ess_time.pack(side='left')
+        if not GLASS:
+            self.ess_time.pack(side='left')
 
         # Error panel: message label + optional action button (e.g. "Configure now")
         self.err_frame = tk.Frame(self.content, bg=BG)
@@ -5990,6 +7689,7 @@ class Widget:
         and the progress drawn on it (not measured: the taskbar cannot be
         watched without showing it to the user). The change then shows as it
         is made, in one step, as it does when DWM refuses the cloak."""
+        self._dodge_snap()
         root = self.root
         self._reshaping = True
         # What _hold and _present ask of a window: on show (the user just
@@ -6003,6 +7703,7 @@ class Widget:
 
         def done():
             self._reshaping = False
+            self._sheen_sync()
             # The update banner follows the widget: in the frame the widget
             # comes out in (_on_banner_follow waits for it).
             self._on_banner_follow()
@@ -6028,14 +7729,14 @@ class Widget:
         if self._expanded:
             # Expanding is 'see everything': show all bars stacked, with a bit
             # more bottom room for the essential-mode overlay controls.
-            self.bottom_pad.config(height=24)
+            self.bottom_pad.config(height=BOTTOM_PAD_OPEN)
             self._pack_stacked(all_bars=True)
             self.btn_expand.config(fg=DOT_W)
             for sec in (self.s_session, self.s_weekly, self.s_sonnet):
                 self._bind_drag_section(sec)
         else:
             self.btn_expand.config(fg=DOT_W_D)
-            self.bottom_pad.config(height=6)
+            self.bottom_pad.config(height=BOTTOM_PAD)
             # back to the collapsed side-by-side strip
             self._enter_ess_collapsed()
         self.root.update_idletasks()
@@ -6082,8 +7783,8 @@ class Widget:
             if self._expanded:
                 self._expanded = False
                 self.btn_expand.config(fg=DOT_W_D)
-            self.bottom_pad.config(height=6)
-            self.ess_bar.place(relx=1.0, x=-18, rely=1.0, y=-1, anchor='se')
+            self.bottom_pad.config(height=BOTTOM_PAD)
+            self.ess_bar.place(relx=1.0, x=-18, rely=1.0, y=-(DOT_Y // 2), anchor='se')
             self._enter_ess_collapsed()
             # Standard mode has a higher floor than the strip, so the trip
             # through it widens the window; without this the strip would come
@@ -6098,7 +7799,7 @@ class Widget:
             self.tb.pack(fill='x')
             self.sep.pack(fill='x')
             self.content.pack(fill='both', expand=True)
-            self.bottom_pad.config(height=6)
+            self.bottom_pad.config(height=BOTTOM_PAD)
             # Normal mode shows the selected bars stacked (same selection as
             # essential), and drags from the title bar only.
             self._pack_stacked()
@@ -6125,7 +7826,7 @@ class Widget:
         self._essential = True
         self.tb.pack_forget()
         self.sep.pack_forget()
-        self.ess_bar.place(relx=1.0, x=-18, rely=1.0, y=-1, anchor='se')
+        self.ess_bar.place(relx=1.0, x=-18, rely=1.0, y=-(DOT_Y // 2), anchor='se')
         self._enter_ess_collapsed()
         self._update_expand_visibility()
         # Apply saved position directly
@@ -6135,7 +7836,7 @@ class Widget:
         self.root.update_idletasks()
         rh = self.root.winfo_reqheight()
         self.root.geometry(f'{w}x{rh}+{x}+{y}')
-        self.root.attributes('-alpha', 0.94)
+        self._set_rest_alpha()
         self._update_minsize()
         self._restore_ess_width(on_launch=True)
 
@@ -6165,8 +7866,8 @@ class Widget:
         bg = HOVER_BG if self._ess_menu_hover else BAR_BG
         pill(cv, 0, 0, w, BAR_H, bg)
         cx, cy = w / 2, BAR_H / 2 - 1
-        half = 5
-        for dy in (-3, 0, 3):
+        half = sz(5)
+        for dy in (-sz(3), 0, sz(3)):
             cv.create_line(cx - half, cy + dy, cx + half, cy + dy,
                            fill=FG, width=1)
 
@@ -6226,6 +7927,9 @@ class Widget:
         Only for the root's own event, and only on a real width change: this
         fires for every child too, and several times per pixel during a drag.
         """
+        if e.widget is self.root and GLASS:
+            self._round_root(e.width, e.height)
+            self._sheen_sync()
         if e.widget is not self.root or e.width == self._last_width:
             return
         self._last_width = e.width
@@ -6276,7 +7980,7 @@ class Widget:
         outgrew the whole gain).
         """
         controls = self.ess_bar.winfo_reqwidth()
-        if not self.ess_time.cget('text'):
+        if not GLASS and not self.ess_time.cget('text'):
             # The clock only appears once the first countdown tick writes it.
             # Reserve it up front, or the floor (and the label form measured
             # against it) would change under the user a moment later.
@@ -6425,7 +8129,7 @@ class Widget:
         for sec in self.ess_bars.values():
             sec.frame.pack_forget()
         n = len(bars)
-        top_pad = 3  # same top spacing for single- and multi-bar (was cramped at 1)
+        top_pad = ROW_GAP  # same top spacing for single- and multi-bar (was cramped at 1)
         # Reserve the hamburger on the right first so the bars fill the
         # remaining width on the left (and the reset text clears the
         # bottom-right controls).
@@ -6479,12 +8183,12 @@ class Widget:
         self.s_sonnet.frame.pack_forget()
         if 'session' in sel:
             self.s_session.set_compact(False)
-            self.s_session.frame.pack(fill='x', padx=PAD, pady=(3, 0))
+            self.s_session.frame.pack(fill='x', padx=PAD, pady=(ROW_GAP, 0))
         show_extra = False
         for code, sec in (('weekly', self.s_weekly), ('sonnet', self.s_sonnet)):
             if code in sel:
                 sec.set_compact(False)
-                sec.frame.pack(fill='x', padx=PAD, pady=(3, 0))
+                sec.frame.pack(fill='x', padx=PAD, pady=(ROW_GAP, 0))
                 show_extra = True
         if show_extra:
             self.extra_frame.pack(fill='x')
@@ -6494,6 +8198,7 @@ class Widget:
     def _resize_bottom_anchored(self):
         """Fit the height to the content, keeping the bottom edge fixed so the
         widget grows upward (safe when parked on the taskbar)."""
+        self._dodge_snap()
         self.root.update_idletasks()
         w = self.root.winfo_width()
         bottom = self.root.winfo_y() + self.root.winfo_height()
@@ -6504,7 +8209,7 @@ class Widget:
         """The expand dot applies only to essential mode: normal mode always
         shows the selected bars stacked, so there is nothing to expand there."""
         if self._essential:
-            self.btn_expand.place(x=6, rely=1.0, y=-4, anchor='sw')
+            self.btn_expand.place(x=DOT_X, rely=1.0, y=-DOT_Y, anchor='sw')
         else:
             self.btn_expand.place_forget()
 
@@ -6542,7 +8247,13 @@ class Widget:
         shown = ([self.ess_bars[b] for b in self._essential_bar_ids()
                   if b in self.ess_bars] if collapsed else [self.s_session])
         text_w = self._reset_width(shown, RESET_NO_PREFIX)
-        tb_w = self.tb.winfo_reqwidth() + 8
+        # The title bar does not propagate its size (pack_propagate(False)), so
+        # its own requested width is a constant 1 and this term never held
+        # anything: at a display scale where the title, the clock and the three
+        # buttons need more than the window had, the clock ran under the
+        # refresh icon. What it needs is what its children ask for.
+        tb_w = (sum(c.winfo_reqwidth() for c in self.tb.winfo_children() if c.winfo_manager()) + 20
+                if self.tb.winfo_manager() else 0)
         # The essential strip is allowed below the standard-mode floor: it has
         # no title bar to fit, and going small is the whole point of it. On the
         # way back to standard mode the block below widens the window again.
@@ -6596,6 +8307,7 @@ class Widget:
         # hamburger on the right in place.
         cur_w = self.root.winfo_width()
         if cur_w > 1 and cur_w < needed:
+            self._dodge_snap()
             right = self.root.winfo_x() + cur_w
             y = self.root.winfo_y()
             # keep_height: the caller sets the height itself once the width has
@@ -6611,6 +8323,8 @@ class Widget:
 
     def _auto_height(self):
         self.root.update_idletasks()
+        if self.root.winfo_reqheight() != self.root.winfo_height():
+            self._dodge_snap()
         x, y = self.root.winfo_x(), self.root.winfo_y()
         w = self.root.winfo_width()
         new_h = self.root.winfo_reqheight()
@@ -6641,6 +8355,7 @@ class Widget:
             target = minw
         cur = self.root.winfo_width()
         if cur > 1 and cur != target:
+            self._dodge_snap()
             right = self.root.winfo_x() + cur
             y = self.root.winfo_y()
             # See _update_minsize: the caller sets the height itself.
@@ -6675,6 +8390,7 @@ class Widget:
         # clips when dragging narrow.
         if self._rs_off:
             return
+        self._dodge_adopt()
         min_w = self.root.wm_minsize()[0] or MIN_W
         w = max(min_w, self._rs_w + (e.x_root - self._rs_x))
         x, y = self.root.winfo_x(), self.root.winfo_y()
@@ -6705,6 +8421,7 @@ class Widget:
                 return
             self._fetch_busy = True
             self._fetch_pending = False
+        self._last_fetch_t = time.monotonic()
         if self._countdown_job:
             self.root.after_cancel(self._countdown_job)
             self._countdown_job = None
@@ -6914,7 +8631,7 @@ class Widget:
             # data already arrived fine and the in-memory key stays valid.
             wlog(f'FETCH  rotated key persist failed: {e}')
 
-    def _on_data(self, d, gen=None):
+    def _on_data(self, d, gen=None, cached_at=None):
         if gen is not None and gen != self._fetch_gen:
             wlog('FETCH  dropped an answer about the account shown before')
             return
@@ -6955,7 +8672,7 @@ class Widget:
                     continue
                 if when.tzinfo is not None and when > now_utc:
                     self._resets_at.append(when)
-        now = f'{datetime.now():%H:%M}'
+        now = f'{(datetime.fromtimestamp(cached_at) if cached_at else datetime.now()):%H:%M}'
         self._last_time = now
         self.btn_r.config(fg=DIM)
         wlog(f'FETCH  ok: session={fh["utilization"] if fh else "?"} weekly={sd["utilization"] if sd else "?"} {self._model_label}={sp if sp is not None else "?"}')
@@ -6965,6 +8682,8 @@ class Widget:
                                    fh.get('resets_at'))
             self._last_session_pct = fh['utilization']
             self._push_taskbar_state()
+        if not cached_at:
+            self._remember_reading(d)
         self._start_countdown()
         self._update_minsize()
         # Again, now that the countdown has written the clock into the strip's
@@ -6979,6 +8698,46 @@ class Widget:
         # systematically lower than the real one, so saving first made the very
         # first refresh invent a preference the user never set.
         self._save_geometry()
+
+    def _remember_reading(self, d):
+        """Keep the last reading on disk, with whose it is and when it was taken,
+        so that a start (or a restart) can show it at once."""
+        try:
+            acc = active_account(self.cfg) or {}
+            path = os.path.join(DATA_DIR, 'last_usage.json')
+            tmp_path = path + '.tmp'
+            with open(tmp_path, 'w', encoding='utf-8') as f:
+                json.dump({'account': acc.get('id'), 'when': time.time(), 'data': d}, f)
+            os.replace(tmp_path, path)
+        except Exception as e:
+            wlog(f'CACHE  not kept: {e}')
+
+    def _show_remembered_reading(self):
+        """Show the last reading while the first fetch of this start is on its
+        way. Without it every start, and every restart, showed an empty bar for
+        about three seconds (the first answer takes that long) and the widget
+        looked as if its bar and its robot were missing.
+
+        Only a reading that is still true to show: the same account's, taken
+        within the last 12 hours, with none of its windows reset since (the
+        usual guard, see _windows_passed). A fetch that has already landed has
+        the last word."""
+        try:
+            if self._has_usage:
+                return
+            with open(os.path.join(DATA_DIR, 'last_usage.json'), encoding='utf-8') as f:
+                rec = json.load(f)
+            acc = active_account(self.cfg) or {}
+            data, when = rec.get('data'), float(rec.get('when') or 0)
+            if (rec.get('account') != acc.get('id') or not isinstance(data, dict)
+                    or time.time() - when > 12 * 3600 or _windows_passed(data)):
+                return
+            self._on_data(data, None, cached_at=when)
+            wlog('CACHE  showing the last reading until the first fetch lands')
+        except (OSError, ValueError, TypeError):
+            pass                           # nothing remembered, or not readable: as before
+        except Exception as e:
+            wlog(f'CACHE  not used: {e}')
 
     TOAST_THRESHOLDS = (25, 50, 75, 90, 95, 100)
 
@@ -7142,6 +8901,172 @@ class Widget:
         self.cfg['theme'] = name
         save_cfg(self.cfg)
         wlog(f'THEME  theme -> {name}')
+        self._restart_soon()
+
+    def _toggle_robot(self):
+        """The robot on the session bar, on or off. It changes the height of
+        the bar, so it takes effect the way a change of look does."""
+        self.cfg['robot'] = not self.cfg.get('robot', GLASS)
+        save_cfg(self.cfg)
+        wlog(f'ROBOT  robot -> {self.cfg["robot"]}')
+        self._restart_soon()
+
+    def _set_appearance(self, name):
+        """Remember the look. It takes effect on the next start, like the theme."""
+        if self.cfg.get('appearance', 'frost') == name:
+            return
+        self.cfg['appearance'] = name
+        save_cfg(self.cfg)
+        wlog(f'LOOK   appearance -> {name}')
+        self._restart_soon()
+
+    def _set_ui_scale(self, value):
+        """Remember the size. It takes effect on the next start, and the menu
+        offers that restart right below (as for the theme)."""
+        if abs(scale_setting(self.cfg) - value) < 1e-6:
+            return
+        self.cfg['ui_scale'] = value
+        # Choosing a size means the widget at that size: a width saved earlier
+        # (narrowed by hand, or left from another size) would hold it small, so
+        # the saved dimensions go and the size's own come up. Position is kept.
+        for key in ('width', 'height', 'ess_width'):
+            self.cfg.pop(key, None)
+        self.cfg['ui_scale_applied'] = value
+        save_cfg(self.cfg)
+        wlog(f'SIZE   ui_scale -> {value}')
+        self._restart_soon()
+
+    def _set_rest_alpha(self):
+        """The translucency at rest, unless a fade is in charge of it."""
+        if not self._alpha_hold:
+            self.root.attributes('-alpha', rest_alpha())
+
+    def _fade_to(self, target, dur, done=None):
+        """Take the window's alpha to `target` over `dur` seconds, eased."""
+        try:
+            start = float(self.root.attributes('-alpha'))
+        except (tk.TclError, ValueError):
+            start = 1.0
+        t0 = time.monotonic()
+
+        def step():
+            k = min(1.0, (time.monotonic() - t0) / dur)
+            try:
+                self.root.attributes('-alpha', start + (target - start) * _ease(k))
+            except tk.TclError:
+                return
+            if k < 1.0:
+                self.root.after(16, step)
+            elif done:
+                done()
+        step()
+
+    def _handoff_begin(self):
+        """Started by a restart (a new theme, look or size): the widget that
+        asked for it is still on the screen, so this one builds itself
+        invisible, takes the readings the other had (it does not show bars
+        with nothing in them while its own fetch is on the way), and only
+        then fades in, as the old one fades out."""
+        try:
+            if self._handoff_data and os.path.isfile(self._handoff_data):
+                with open(self._handoff_data, encoding='utf-8') as f:
+                    data = json.load(f)
+                if isinstance(data, dict) and has_credentials(self.cfg):
+                    self._on_data(data)
+        except Exception as e:
+            wlog(f'HANDOFF readings not taken over: {e}')
+        try:
+            self.root.update_idletasks()
+        except tk.TclError:
+            return
+        self.root.after(140, self._handoff_show)
+
+    def _handoff_show(self):
+        try:
+            if self._handoff:
+                open(self._handoff, 'w').close()        # the old widget is waiting for this
+        except OSError as e:
+            wlog(f'HANDOFF could not signal: {e}')
+
+        def settled():
+            self._alpha_hold = False
+            self._set_rest_alpha()
+            self._sheen_sync()
+            try:
+                if self._handoff:
+                    open(self._handoff + '.done', 'w').close()    # the old one can go
+            except OSError:
+                pass
+        if FROST:
+            # No fade: it would make the window a layered one for as long as it
+            # lasts, with no frost. It appears whole over the old one, which is
+            # the same picture, and the old one leaves.
+            self.root.attributes('-alpha', 1.0)
+            self.root.after(80, settled)
+            return
+        self._fade_to(rest_alpha(), HANDOFF_FADE_S, settled)
+
+    def _handoff_wait(self, proc, marker, t0, seen=None):
+        """The old widget, after starting the new one. It stays exactly as it
+        is, opaque, until the new one has shown itself; then it steps down
+        behind it and the new one fades in OVER it, so the screen goes from one
+        look to the other with the old one under every frame of the fade. It
+        leaves only when the new one says it is all the way in. (Fading both at
+        once dipped to a third visible whenever the new one's first frames
+        were late: it was still starting up.)"""
+        try:
+            now = time.monotonic()
+            if os.path.exists(marker):
+                if seen is None:
+                    wlog('RESTART the new widget is up: it fades in over this one')
+                    self._quit_geometry_saved = True    # already written, and by now the new one owns the file
+                    self._yielding = True               # no more raising itself above the new one
+                    self._cancel_topmost()
+                    try:
+                        self.root.attributes('-topmost', False)
+                    except tk.TclError:
+                        pass
+                    seen = now
+                if os.path.exists(marker + '.done') or now - seen > 2.5:
+                    for path in (marker, marker + '.done', getattr(self, '_handoff_out', None)):
+                        try:
+                            if path:
+                                os.remove(path)
+                        except OSError:
+                            pass
+                    self._quit()
+                    return
+            elif proc.poll() is not None:
+                wlog('RESTART the new widget did not start: staying')
+                self._restart_pending = False
+                return
+            elif now - t0 > 8.0:
+                wlog('RESTART the new widget is slow: quitting anyway')
+                self._quit()
+                return
+            self.root.after(30, lambda: self._handoff_wait(proc, marker, t0, seen))
+        except tk.TclError:
+            pass
+
+    def _cancel_topmost(self):
+        job, self._topmost_job = self._topmost_job, None
+        if job:
+            try:
+                self.root.after_cancel(job)
+            except (tk.TclError, ValueError):
+                pass
+
+    def _restart_soon(self):
+        """A change of theme, look or size is built into every widget, and Tk
+        cannot repaint one afterwards, so it takes effect by starting the
+        widget again, in the same place. Done at once, as the choice is made:
+        it used to wait for a separate "Restart" row, and a choice that shows
+        nothing reads as one that did not work."""
+        if getattr(self, '_restart_pending', False):
+            return
+        self._restart_pending = True
+        self._close_menu()
+        self.root.after(250, self._restart_widget)
 
     def _restart_widget(self):
         """Relaunch and quit, so a new theme is built into the interface.
@@ -7163,17 +9088,40 @@ class Widget:
                 globals()['_mutex'] = None
             except Exception as e:
                 wlog(f'RESTART single-instance lock not released: {e}')
+                self._restart_pending = False
                 return
         try:
             args = ([sys.executable] if getattr(sys, 'frozen', False)
                     else [sys.executable, os.path.abspath(__file__)])
-            subprocess.Popen(args, creationflags=subprocess.DETACHED_PROCESS
-                             | subprocess.CREATE_NEW_PROCESS_GROUP, close_fds=True)
+            # The new widget fades in over this one and this one fades out
+            # (_handoff_wait): it is told where to say it is ready, and given
+            # the readings this one has.
+            marker = os.path.join(DATA_DIR, 'handoff.ready')
+            self._handoff_out = os.path.join(DATA_DIR, 'handoff.json')
+            for path in (marker, self._handoff_out):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+            env = dict(os.environ, CLAUDE_USAGE_HANDOFF=marker)
+            try:
+                if self._last_data:
+                    with open(self._handoff_out, 'w', encoding='utf-8') as f:
+                        json.dump(self._last_data, f)
+                    env['CLAUDE_USAGE_HANDOFF_DATA'] = self._handoff_out
+            except (OSError, TypeError, ValueError):
+                pass
+            proc = subprocess.Popen(args, creationflags=subprocess.DETACHED_PROCESS
+                                    | subprocess.CREATE_NEW_PROCESS_GROUP,
+                                    close_fds=True, env=env)
         except Exception as e:
             wlog(f'RESTART failed: {e}')
+            self._restart_pending = False
             return
-        wlog('RESTART relaunched, quitting')
-        self._quit()
+        wlog('RESTART relaunched, waiting for the new widget')
+        self._dodge_snap()
+        self._dodge_stop()
+        self._handoff_wait(proc, marker, time.monotonic())
 
     def _toggle_reset_part(self, part, close=True):
         """Show or hide one half of the line under the bars: the clock the
@@ -7315,6 +9263,692 @@ class Widget:
             self._set_pulse(False)
             self._countdown_job = None
 
+    # ── Getting out of the way ──────────────────────
+    #
+    # The one rule: while the widget is away from its place, THAT PLACE is its
+    # position. _dodge_home holds it. Everything that writes the position down
+    # (_save_geometry) or works from it reads _home_xy, and everything that
+    # changes the window's size or layout first brings it back (_dodge_snap).
+
+    def _home_xy(self):
+        """Where the widget lives: its place, even while it is out of the way."""
+        if self._dodge_home is not None:
+            return self._dodge_home
+        return self.root.winfo_x(), self.root.winfo_y()
+
+    def _dodge_enabled(self):
+        return bool(self.cfg.get('auto_dodge', True))
+
+    def _dodge_start(self):
+        if self._dodge_job is None and self._dodge_enabled():
+            self._dodge_job = self.root.after(DODGE_POLL_MS, self._dodge_tick)
+
+    def _dodge_stop(self):
+        job, self._dodge_job = self._dodge_job, None
+        if job:
+            try:
+                self.root.after_cancel(job)
+            except (tk.TclError, ValueError):
+                pass
+        self._dodge_cancel_glide()
+
+    def _dodge_tick(self):
+        self._dodge_job = None
+        try:
+            self._dodge_step()
+        except tk.TclError:
+            return
+        except Exception as e:
+            wlog(f'DODGE  step error: {e}')
+        try:
+            if self._dodge_enabled():
+                self._dodge_job = self.root.after(DODGE_POLL_MS, self._dodge_tick)
+        except tk.TclError:
+            pass
+
+    def _dodge_ui_busy(self):
+        """A menu, dialog or banner of the widget's is open: they were placed
+        beside the widget where it stood, and it must not move from under them."""
+        try:
+            # The menu and its flyout count from the moment they exist, not
+            # from the moment they are on show: a menu takes a few tenths of a
+            # second to appear, and the pointer that clicked its button was
+            # still in the widget meanwhile (it slid away as the menu opened).
+            for win in (self._menu_win, self._flyout_win):
+                if win is not None and win.winfo_exists():
+                    return True
+            if (self._update_banner is not None and self._update_banner.winfo_exists()
+                    and self._update_banner.winfo_viewable()):
+                return True
+            for dlg in self._open_dialogs:
+                if dlg.winfo_exists() and dlg.winfo_viewable():
+                    return True
+        except tk.TclError:
+            return False
+        return False
+
+    def _dodge_step(self):
+        if self._dodge_glide is not None:
+            return                                  # in the middle of a slide
+        if self._reshaping or self._dodge_ui_busy():
+            # Hold still, wherever it is: a menu in use must not have the widget
+            # move under it, neither away nor home. It carries on when the
+            # menu has closed (still away, it goes home once the pointer has
+            # left its place).
+            self._dodge_dwell = self._dodge_gone = None
+            return
+        ps = pointer_state()
+        if ps is None:
+            return
+        px, py, pressed, ctrl = ps
+        now = time.monotonic()
+        vel, heading = self._pointer_velocity(now, px, py)
+        x, y = self.root.winfo_x(), self.root.winfo_y()
+        w, h = self.root.winfo_width(), self.root.winfo_height()
+        hx, hy = self._home_xy()
+        in_here = x <= px < x + w and y <= py < y + h
+        if self._dodge_home is None or in_here:
+            # At its place, or out of it with the pointer come to it again.
+            self._dodge_gone = None
+            if not in_here or pressed or ctrl:
+                self._dodge_dwell = None
+                self._dodge_confirm = None
+                return
+            if self._dodge_dwell is None:
+                self._dodge_dwell = now
+                return
+            if math.hypot(*vel) > DODGE_PASS_SPEED:
+                self._dodge_dwell = now             # passing through: not a reason to move
+                return
+            if now - self._dodge_dwell < DODGE_DWELL_MS / 1000:
+                return
+            if now < self._dodge_next_check:
+                return
+            hb = self._menu_anchor()
+            if hb and hb[0] - 6 <= px < hb[0] + hb[2] + 6 and hb[1] - 6 <= py < hb[1] + hb[3] + 6:
+                self._dodge_next_check = now + 0.4
+                return                              # on the way to the menu: let it be pressed
+            why = []
+            if covering_level(x, y, w, h, why=why) < 2:
+                # Hiding nothing: stay put, and do not look again at every tick
+                # while the pointer rests there.
+                self._dodge_confirm = None
+                self._dodge_next_check = now + 0.5
+                return
+            if self._dodge_confirm is None:
+                self._dodge_confirm = now           # seen once: look again before moving,
+                return                              # for what was there a moment ago may be going
+            if now - self._dodge_confirm < 0.12:
+                return
+            self._dodge_confirm = None
+            self._dodge_dwell = None
+            wlog(f'DODGE  covering {why[:2]}')
+            self._dodge_away((hx, hy), (x, y, w, h), (px, py), heading)
+            return
+        # Out of its place, pointer elsewhere: back once it has gone from there.
+        self._dodge_dwell = None
+        m = DODGE_RETURN_MARGIN
+        near_home = hx - m <= px < hx + w + m and hy - m <= py < hy + h + m
+        if near_home or pressed or ctrl:
+            self._dodge_gone = None
+            return
+        if self._dodge_gone is None:
+            self._dodge_gone = now
+        elif now - self._dodge_gone >= DODGE_RETURN_MS / 1000:
+            self._dodge_gone = None
+            self._dodge_go_home()
+
+    def _pointer_velocity(self, now, px, py):
+        """(now, heading): the pointer's velocity (px/s) over the last tenth of
+        a second or so, and the velocity it last had while it was really moving.
+        The second is what says which way it came: by the time it has rested on
+        the widget long enough to move it, the first is nothing."""
+        hist = self._ptr_hist
+        hist.append((now, px, py))
+        while hist and now - hist[0][0] > 0.30:
+            hist.popleft()
+        cur = (0.0, 0.0)
+        for t0, x0, y0 in hist:
+            if now - t0 >= 0.06:
+                dt = now - t0
+                cur = ((px - x0) / dt, (py - y0) / dt)
+                break
+        if math.hypot(*cur) > 180:
+            self._ptr_heading = (cur[0], cur[1], now)
+        head = getattr(self, '_ptr_heading', None)
+        heading = (head[0], head[1]) if head and now - head[2] < 1.6 else (0.0, 0.0)
+        return cur, heading
+
+    def _dodge_away(self, home, rect, pointer, vel):
+        x, y, w, h = rect
+        info = _monitor_of(x, y, w, h, _MONITOR_DEFAULTTONEAREST)
+        if not info:
+            return
+        away = self._dodge_home is not None
+        target = dodge_plan(
+            rect, pointer, vel, info[1],
+            lambda tx, ty: _COVER_COST[covering_level(tx, ty, w, h)],
+            (sz(DODGE_ZONE[0]), sz(DODGE_ZONE[1])), sz(DODGE_MARGIN), sz(DODGE_MIN_SHIFT),
+            home=home if away else None, reach=(max(w, h) * 1.25) if away else None)
+        if target is None:
+            return
+        if self._dodge_home is None:
+            self._dodge_home = (x, y)
+        wlog(f'DODGE  from {(x, y)} to {target} (home {self._dodge_home}, '
+             f'pointer {pointer}, speed {math.hypot(*vel):.0f})')
+        self._hide_tooltips()
+        self._dodge_glide_to(target)
+
+    def _dodge_go_home(self):
+        home = self._dodge_home
+        if home is None:
+            return
+        self._dodge_glide_to(home, done=self._dodge_arrived)
+
+    def _dodge_arrived(self):
+        self._dodge_home = None
+        self._dodge_gone = self._dodge_dwell = None
+
+    def _dodge_cancel_glide(self):
+        glide, self._dodge_glide = self._dodge_glide, None
+        if glide:
+            try:
+                self.root.after_cancel(glide)
+            except (tk.TclError, ValueError):
+                pass
+        if self._timer_hi:
+            self._timer_hi = False
+            _timer_resolution(False)
+
+    def _dodge_glide_to(self, target, done=None):
+        """Slide the window to `target` like a mass on a critically damped
+        spring: it starts gently, goes quickly in the middle, arrives without
+        overshoot, and there is no fixed duration to cut short, so a slide is
+        the same smooth movement whatever its length.
+
+        🔴 Through Tk (geometry), as the drag does, and not by moving the
+        window behind Tk's back: measured on 2026-11-15, after a slide made
+        with SetWindowPos Tk went on ignoring every later geometry() call, so
+        a drag of the widget, or any resize, moved nothing."""
+        self._dodge_cancel_glide()
+        tx, ty = target
+        st = {'x': float(self.root.winfo_x()), 'y': float(self.root.winfo_y()),
+              'vx': 0.0, 'vy': 0.0, 't': time.perf_counter(),
+              'shown': (self.root.winfo_x(), self.root.winfo_y())}
+        w0 = DODGE_SPRING_W
+        _timer_resolution(True)
+        self._timer_hi = True
+
+        def axis(p, v, tgt, dt):
+            d = p - tgt
+            c = v + w0 * d
+            e = math.exp(-w0 * dt)
+            return tgt + (d + c * dt) * e, (v - w0 * c * dt) * e
+
+        def frame():
+            self._dodge_glide = None
+            try:
+                now = time.perf_counter()
+                dt = min(0.05, max(0.001, now - st['t']))
+                st['t'] = now
+                st['x'], st['vx'] = axis(st['x'], st['vx'], tx, dt)
+                st['y'], st['vy'] = axis(st['y'], st['vy'], ty, dt)
+                rest = (abs(st['x'] - tx) < 0.4 and abs(st['y'] - ty) < 0.4
+                        and abs(st['vx']) < 12 and abs(st['vy']) < 12)
+                pos = (tx, ty) if rest else (int(round(st['x'])), int(round(st['y'])))
+                if pos != st['shown']:
+                    self.root.geometry(f'+{pos[0]}+{pos[1]}')
+                    # Applied now, not when Tk next has nothing to do: otherwise
+                    # frames pile up behind each other and arrive in bursts.
+                    self.root.update_idletasks()
+                    st['shown'] = pos
+                if not rest:
+                    self._dodge_glide = self.root.after(DODGE_FRAME_MS, frame)
+                    return
+            except tk.TclError:
+                return
+            settle(0)
+
+        def settle(tries):
+            """Tk applies a move when it is idle and can drop one that came
+            while another was being applied, so the last of the slide is not
+            taken for granted: it is looked at, and asked again if it did not
+            land."""
+            self._dodge_glide = None
+            try:
+                self.root.update_idletasks()
+                if (self.root.winfo_x(), self.root.winfo_y()) != (tx, ty) and tries < 6:
+                    self.root.geometry(f'+{tx}+{ty}')
+                    self._dodge_glide = self.root.after(30, lambda: settle(tries + 1))
+                    return
+            except tk.TclError:
+                return
+            if self._timer_hi:
+                self._timer_hi = False
+                _timer_resolution(False)
+            if done:
+                done()
+        frame()
+
+    def _dodge_snap(self):
+        """Back in its place at once, for whatever is about to change the
+        window's size or position and must start from there. A no-op while the
+        widget is in its place."""
+        if self._dodge_home is None:
+            return
+        self._dodge_cancel_glide()
+        hx, hy = self._dodge_home
+        self._dodge_home = None
+        self._dodge_gone = self._dodge_dwell = None
+        try:
+            self.root.geometry(f'+{hx}+{hy}')
+            self.root.update_idletasks()
+        except tk.TclError:
+            pass
+
+    def _dodge_adopt(self):
+        """The user took hold of the widget and is moving it: where it is now
+        is where it lives, from here on."""
+        if self._dodge_home is None:
+            return
+        self._dodge_cancel_glide()
+        self._dodge_home = None
+        self._dodge_gone = self._dodge_dwell = None
+
+    def _toggle_dodge(self):
+        self.cfg['auto_dodge'] = not self._dodge_enabled()
+        save_cfg(self.cfg)
+        on = self._dodge_enabled()
+        wlog(f'DODGE  auto_dodge -> {on}')
+        if on:
+            self._dodge_start()
+        else:
+            self._dodge_stop()
+            self._dodge_snap()
+        self._tray_update()
+
+    # ── Notification-area icon ──────────────────────
+
+    def _start_tray(self):
+        try:
+            on, off = make_tray_icons(ICO, DATA_DIR)
+            self._tray = TrayIcon(self.root, on, off, self._toggle_dodge, self._tray_menu)
+            atexit.register(self._tray.close)
+            self._tray_update()
+            self._tray_poll()
+            wlog('TRAY   icon added')
+        except Exception as e:
+            self._tray = None
+            wlog(f'TRAY   not available: {e}')
+
+    def _tray_poll(self):
+        tray = self._tray
+        if not tray:
+            return
+        try:
+            tray.drain()
+            self.root.after(TRAY_POLL_MS, self._tray_poll)
+        except tk.TclError:
+            pass                    # the widget is closing
+
+    def _tray_update(self):
+        tray = getattr(self, '_tray', None)
+        if not tray:
+            return
+        on = self._dodge_enabled()
+        tray.show('on' if on else 'off', t('tray_tip_on') if on else t('tray_tip_off'))
+
+    def _tray_menu(self):
+        tray = getattr(self, '_tray', None)
+        if not tray:
+            return
+        on = self._dodge_enabled()
+        cmd = tray.popup([
+            (1, t('tray_dodge'), on),
+            None,
+            (2, t('tray_menu'), False),
+            (3, t('menu_refresh'), False),
+            (4, t('tray_home'), False),
+            None,
+            (5, t('menu_quit'), False)])
+        if cmd == 1:
+            self._toggle_dodge()
+        elif cmd == 2:
+            self._dodge_snap()
+            self._show_menu()
+        elif cmd == 3:
+            self.refresh()
+        elif cmd == 4:
+            self._dodge_snap()
+        elif cmd == 5:
+            self._quit()
+
+    # ── Glass ───────────────────────────────────────
+
+    def _apply_glass(self):
+        """Take the outline off the window, after dwm_round has set its
+        corners, and start following the screen."""
+        if not GLASS:
+            return
+        hwnd = getattr(self, '_hwnd', None)
+        if hwnd:
+            glass_no_border(hwnd)
+            self._round_root(self.root.winfo_width(), self.root.winfo_height())
+        self._sheen_start()
+        self._glass_tint = None
+        self._title_bg = BG_TITLE
+        if FROST and hwnd and frost_backdrop(hwnd, self.root.winfo_width(), self.root.winfo_height(), corner_radius(hwnd)):
+            # After it: the extended frame (-1 margins) is what gives the window
+            # Windows' shadow, a dark halo round the widget that no attribute
+            # turns off. Measured 2026-11-15: taking the margins back to 0 once
+            # the blur is on removes the halo and the frost stays.
+            # (Only once the window is on screen: before that Windows keeps the
+            # shadow. Done a moment after it appears, and once more to be sure.)
+            for delay in (400, 1500, 4000):
+                self.root.after(delay, lambda: self._frost_no_shadow(hwnd))
+            wlog('FROST  backdrop on: the widget is painted on black')
+            self._frost_on = True
+            self._tint_start()
+            self._glass_paint(FROST_BLACK, FROST_BLACK)
+            self._glass_tick()              # keeps the colours true to the frost
+            return
+        if FROST:
+            wlog('FROST  backdrop refused: the glass look instead')
+        self._glass_tick()
+
+    def _glass_tick(self):
+        """Look at the screen round the widget and retint the glass to it, a
+        few seconds apart: the screen behind a widget changes slowly. The
+        capture takes tens of milliseconds, so it runs off the Tk thread (on it,
+        it stuttered every animation it landed in).
+
+        🔴 And that thread never calls Tk: it leaves its answer in an
+        attribute and this timer, on the Tk thread, picks it up. A call into
+        Tkinter from another thread that fails left the "busy" flag set for
+        good, and the glass quietly stopped following the screen; the same
+        family of call crashed the tray icon."""
+        try:
+            res, self._glass_result = self._glass_result, None
+            if res is not None:
+                self._glass_busy = False
+                if (self._dodge_glide is None and not self._reshaping
+                        and not self._dragging_now()):
+                    if self._frost_on:
+                        self._frost_follow(res[0])
+                    else:
+                        self._glass_follow(res[0])
+            now = time.monotonic()
+            if (GLASS and not self._reshaping and self._dodge_glide is None
+                    and not self._dragging_now() and not self._glass_busy
+                    and now - self._glass_last >= GLASS_TINT_MS / 1000
+                    and self.root.winfo_viewable()):
+                rect = (self.root.winfo_x(), self.root.winfo_y(),
+                        self.root.winfo_width(), self.root.winfo_height())
+                self._glass_busy = True
+                self._glass_last = now
+
+                def look():
+                    try:
+                        tint = (frost_level(*rect) if self._frost_on else screen_tint(*rect))
+                    except Exception:
+                        tint = None
+                    self._glass_result = (tint,)
+                threading.Thread(target=look, daemon=True).start()
+        except Exception as e:
+            wlog(f'GLASS  tint error: {e}')
+        try:
+            self.root.after(GLASS_POLL_MS, self._glass_tick)
+        except tk.TclError:
+            pass
+
+    _frost_on = False
+    _round_size = None
+    _sheen = None
+    _tint = None
+
+    def _sheen_start(self):
+        """The light over the glass, for the glass looks (cfg `sheen`)."""
+        if not (GLASS and self.cfg.get('sheen', True)) or self._sheen is not None:
+            return
+        try:
+            self._sheen = Sheen()
+            atexit.register(self._sheen.close)
+            wlog('SHEEN  the light over the glass is on')
+            self._sheen_sync()
+        except Exception as e:
+            self._sheen = None
+            wlog(f'SHEEN  not available: {e}')
+
+    def _tint_start(self):
+        if self._tint is not None:
+            return
+        try:
+            self._tint = Tint()
+            atexit.register(self._tint.close)
+            wlog('FROST  the dark of the frost is on, under the widget')
+            self._sheen_sync()
+        except Exception as e:
+            self._tint = None
+            wlog(f'FROST  tint not available: {e}')
+
+    def _sheen_sync(self):
+        """Put the sheen (and the frost's dark under the widget) where the
+        widget is, or take them away while the widget is not itself to be seen
+        (reshaping behind its picture, fading in)."""
+        sh, tn = self._sheen, self._tint
+        if not sh and not tn:
+            return
+        try:
+            show = (self.root.winfo_viewable() and not self._reshaping and not self._alpha_hold)
+            args = (self.root.winfo_rootx(), self.root.winfo_rooty(), self.root.winfo_width(),
+                    self.root.winfo_height(), corner_radius(), THEME == 'dark', show)
+            if tn:
+                tn.update(*args, under=getattr(self, '_hwnd', None))
+            if sh:
+                sh.update(*args)
+        except tk.TclError:
+            pass
+        except Exception as e:
+            wlog(f'SHEEN  error: {e}')
+
+    def _tint_hwnds(self):
+        t = self._tint
+        return (t.hwnd,) if (t and t.hwnd and t.shown) else ()
+
+    def _sheen_hwnds(self):
+        sh = self._sheen
+        return (sh.hwnd,) if (sh and sh.hwnd and sh.shown) else ()
+
+    def _frost_display_check(self, x, y, w, h):
+        """Frost on a normal display, the opaque glass on one in HDR: when the
+        widget is moved to a display of the other kind, or HDR is switched, the
+        look it is running in is wrong for where it is, and it restarts into
+        the right one (the usual crossfade). Seen twice in a row first, 2 s
+        apart, so that dragging across the join of two screens does not flip
+        it back and forth."""
+        if (self.cfg.get('appearance', 'frost') != 'frost' or THEME != 'dark'
+                or os.environ.get('CLAUDE_USAGE_FORCE_FROST')
+                or getattr(self, '_restart_pending', False)):
+            return
+        if self._dragging_now() or self._reshaping or self._dodge_glide is not None:
+            return
+        fit = frost_supported_here(x, y, w, h)
+        if fit == self._frost_started_as:
+            self._frost_mismatch = 0
+            return
+        self._frost_mismatch += 1
+        if self._frost_mismatch >= 2:
+            wlog(f'FROST  the display under the widget changed ({"normal" if fit else "HDR"}): restarting '
+                 f'into the {"frost" if fit else "opaque glass"} look')
+            self._frost_mismatch = 0
+            self._restart_soon()
+
+    def _round_root(self, w, h):
+        """The glass looks have rounder corners than Windows gives."""
+        if (w, h) == self._round_size or w < 20 or h < 20:
+            return
+        hwnd = getattr(self, '_hwnd', None)
+        if hwnd and round_region(hwnd, w, h, corner_radius(hwnd)):
+            self._round_size = (w, h)
+            if getattr(self, '_frost_on', False):
+                frost_blur(hwnd, w, h, corner_radius(hwnd))
+
+    def _frost_no_shadow(self, hwnd):
+        try:
+            if getattr(self, '_restart_pending', False) or not self.root.winfo_viewable():
+                return
+        except (tk.TclError, AttributeError):
+            return
+        try:
+            class _M(ctypes.Structure):
+                _fields_ = [('l', ctypes.c_int), ('r', ctypes.c_int), ('t', ctypes.c_int), ('b', ctypes.c_int)]
+            ctypes.windll.dwmapi.DwmExtendFrameIntoClientArea(hwnd, ctypes.byref(_M(0, 0, 0, 0)))
+            frost_blur(hwnd, self.root.winfo_width(), self.root.winfo_height(), corner_radius(hwnd))
+        except Exception:
+            pass
+
+    def _frost_follow(self, level):
+        """Repaint the colours that are added to the frost when its brightness
+        has changed enough to show: what the widget paints is the colour it
+        means MINUS the frost under it (see FROST_B0), so a brighter frost (a
+        white window behind) needs less paint, a darker one more."""
+        global FROST_B0
+        if level is None:
+            return
+        new = tuple(max(8, min(96, int(c))) for c in level)
+        if max(abs(a - b) for a, b in zip(new, FROST_B0)) < 14:
+            return
+        FROST_B0 = new
+        _GLASS_BAR_CACHE.clear()
+        _ROBOT_PHOTOS.clear()
+        for sec in self._all_sections():
+            sec._draw(sec.cv.winfo_width())
+
+    def _glass_follow(self, tint):
+        if tint is None:
+            return
+        old = self._glass_tint
+        if old is not None and max(abs(a - b) for a, b in zip(tint, old)) < 6:
+            return                      # not different enough to be worth a repaint
+        self._glass_tint = tint
+        self._glass_paint(*glass_colors(tint, THEME == 'dark'))
+
+    def _glass_paint(self, body, title):
+        """Colour every surface of the widget: the body everywhere but the title
+        band, which is a step lighter. Containers and what is drawn on them
+        take the same colour, or a seam shows where two meet."""
+        self._title_bg = title
+        for w in (self.root, self.main, self.content, self.extra_frame, self.ess_row,
+                  self.bottom_pad, self.err_frame, self.lbl_err, self.btn_expand,
+                  self.btn_resize, self.ess_bar, self.ess_close, self.ess_refresh,
+                  self.ess_time, self.ess_menu):
+            try:
+                w.config(bg=body)
+            except tk.TclError:
+                pass
+        for w in [self.tb, *self.tb.winfo_children()]:
+            try:
+                w.config(bg=title)
+            except tk.TclError:
+                pass
+        try:
+            if self._frost_on:
+                self.sep.config(bg='#1c1e24')            # added to the frost: a hairline of light
+            else:
+                self.sep.config(bg=_lerp_hex(title, '#ffffff' if THEME == 'dark' else '#000000', 0.07))
+        except tk.TclError:
+            pass
+        for sec in self._all_sections():
+            sec.set_bg(body)
+        self._draw_ess_menu()
+
+    # ── Live view ───────────────────────────────────
+
+    def _live_tick(self):
+        """Keep "resets in 2h 05min" true between fetches. The text used to be
+        written when a reading arrived and left to go stale until the next one.
+        Only a change of the text costs anything: the floor is re-measured then,
+        as it is after a fetch."""
+        try:
+            if not self._reshaping:
+                changed = False
+                for sec in self._all_sections():
+                    sec.refresh_tone()
+                    if sec._state == 'ok' and not sec._err and sec._resets_at:
+                        before = sec.lbl_sub.cget('text')
+                        sec.redraw_reset()
+                        if sec.lbl_sub.cget('text') != before:
+                            changed = True
+                if changed:
+                    self._sync_ess_reset_mode()
+                    self._update_minsize()
+        except Exception as e:
+            wlog(f'LIVE   tick error: {e}')
+        finally:
+            self.root.after(LIVE_TICK_MS, self._live_tick)
+
+    def _start_activity_watch(self):
+        """Watch where Claude Code writes its transcripts. A change there means
+        usage just moved, so a reading is asked for soon after instead of at the
+        next poll. Off the Tk thread: it lists directories."""
+        base = os.environ.get('CLAUDE_CONFIG_DIR') or os.path.join(
+            os.path.expanduser('~'), '.claude')
+        folder = os.path.join(base, 'projects')
+
+        def newest():
+            top = 0.0
+            try:
+                with os.scandir(folder) as projects:
+                    for proj in projects:
+                        if not proj.is_dir():
+                            continue
+                        with os.scandir(proj.path) as files:
+                            for f in files:
+                                if f.name.endswith('.jsonl'):
+                                    top = max(top, f.stat().st_mtime)
+            except OSError:
+                pass
+            return top
+
+        def run():
+            seen = newest()
+            while True:
+                time.sleep(ACTIVITY_POLL_S)
+                cur = newest()
+                if cur > seen:
+                    seen = cur
+                    try:
+                        self.root.after(0, self._on_activity)
+                    except (tk.TclError, RuntimeError):
+                        return
+
+        try:
+            threading.Thread(target=run, daemon=True).start()
+        except Exception as e:
+            wlog(f'LIVE   activity watch not started: {e}')
+
+    def _on_activity(self):
+        if self._activity_job is not None or not self.cfg.get('live_updates', True):
+            return
+        delay = max(ACTIVITY_SETTLE_S,
+                    ACTIVITY_MIN_GAP_S - (time.monotonic() - self._last_fetch_t))
+        self._activity_job = self.root.after(int(delay * 1000), self._activity_refresh)
+
+    def _activity_refresh(self):
+        self._activity_job = None
+        # Only a widget that is working: with an error or a rate limit on show
+        # a faster poll would only repeat the refusal.
+        if (self.cfg.get('live_updates', True) and self._has_usage
+                and not getattr(self, '_last_error', None) and not self._soft_note
+                and not self._reshaping):
+            wlog('LIVE   Claude Code activity -> refreshing')
+            self.refresh()
+
+    def _toggle_live(self):
+        self.cfg['live_updates'] = not self.cfg.get('live_updates', True)
+        save_cfg(self.cfg)
+        wlog(f'LIVE   live_updates -> {self.cfg["live_updates"]}')
+
     def _clear_error(self):
         """Hide the error panel and drop any pending action binding."""
         had_panel = bool(self.err_frame.winfo_manager())
@@ -7361,6 +9995,7 @@ class Widget:
         right edge."""
         if self._essential and not self._expanded:
             return
+        self._dodge_snap()
         try:
             self.root.update_idletasks()
             w, h = self.root.winfo_width(), self.root.winfo_height()
@@ -7454,11 +10089,45 @@ class Widget:
     def _drag_start(self, e):
         self._hide_tooltips()
         self._dx, self._dy = e.x, e.y
+        self._drag_regrab(e)
+
+    def _drag_regrab(self, e):
+        """Where on the window the pointer took hold, in screen terms."""
+        if getattr(e, 'x_root', None) is not None:
+            self._drag_grab = (e.x_root - self.root.winfo_x(),
+                               e.y_root - self.root.winfo_y())
+        else:
+            self._drag_grab = None
+        self._drag_last = None
+
+    def _dragging_now(self):
+        """True while the widget is being dragged: it has been moved by the
+        pointer within the last moment. Things that cost a frame (the capture
+        of the screen round it, the always-on-top reassertion) wait for it."""
+        return time.monotonic() - getattr(self, '_drag_t', -9.0) < 0.3
 
     def _drag_move(self, e):
-        x = self.root.winfo_x() + e.x - self._dx
-        y = self.root.winfo_y() + e.y - self._dy
+        if self._dodge_home is not None:
+            self._dodge_adopt()
+            self._drag_regrab(e)        # it was somewhere else when the press landed
+        grab = getattr(self, '_drag_grab', None)
+        if grab is None:
+            x = self.root.winfo_x() + e.x - self._dx
+            y = self.root.winfo_y() + e.y - self._dy
+        else:
+            # 🔴 From the pointer's place on the SCREEN, not from the window's
+            # position plus the pointer's place in the window: Tk reports the
+            # window where it was a moment ago, and that sum, taken at every
+            # motion event, trailed the pointer and jittered under it.
+            x, y = e.x_root - grab[0], e.y_root - grab[1]
+        if (x, y) == getattr(self, '_drag_last', None):
+            return
+        self._drag_last = (x, y)
+        self._drag_t = time.monotonic()
         self.root.geometry(f'+{x}+{y}')
+        # Applied now, not at the next idle moment, which the 10 ms timers and
+        # the motion events themselves keep from coming.
+        self.root.update_idletasks()
 
     def _on_anchor_monitor(self):
         """True if the widget currently sits on its anchor's monitor, or has no
@@ -7525,12 +10194,14 @@ class Widget:
         # Resting state is translucent; restore it after a resize drag (which
         # turns the window opaque for smoothness) ends on this release.
         try:
-            self.root.attributes('-alpha', 0.94)
+            self._set_rest_alpha()
         except Exception:
             pass
         try:
-            self.cfg['x'] = self.root.winfo_x()
-            self.cfg['y'] = self.root.winfo_y()
+            # The widget's place, not where it happens to be this instant:
+            # out of the way it would otherwise be saved there, and the
+            # anchor with it (see _home_xy).
+            self.cfg['x'], self.cfg['y'] = self._home_xy()
             self.cfg['width'] = self.root.winfo_width()
             self.cfg['height'] = self.root.winfo_height()
             # The error panel is transient: the window grew upward to show it
@@ -7618,8 +10289,11 @@ class Widget:
         try:
             x, y = self.root.winfo_x(), self.root.winfo_y()
             w, h = self.root.winfo_width(), self.root.winfo_height()
+            self._frost_display_check(x, y, w, h)
             sig = _monitor_signature()
             if sig != self._mon_sig:
+                self._dodge_snap()
+                x, y = self.root.winfo_x(), self.root.winfo_y()
                 self._mon_sig = sig
                 target = self._resolve_anchor(w, h) or (x, y)
                 nx, ny, _moved = _place_on_screen(target[0], target[1], w, h)
@@ -7632,6 +10306,7 @@ class Widget:
             else:
                 nx, ny, moved = _place_on_screen(x, y, w, h)
                 if moved:
+                    self._dodge_snap()
                     wlog(f'WATCH  off all monitors ({x},{y}) -> rescued to ({nx},{ny})')
                     self.cfg['x'], self.cfg['y'] = nx, ny
                     self.root.geometry(f'+{nx}+{ny}')
@@ -7803,8 +10478,36 @@ class Widget:
         wy = max(mt + SCREEN_MARGIN, min(wy, mb - dh - TASKBAR_GAP))
         return wx, wy
 
+    def _menu_anchor(self):
+        """Screen rectangle (x, y, w, h) of the hamburger that is on show: the
+        title bar's, or the strip's in the essential view. None when neither
+        is (the expanded essential view has no hamburger)."""
+        for w in (self.btn_menu, self.ess_menu):
+            try:
+                if w.winfo_ismapped():
+                    return (w.winfo_rootx(), w.winfo_rooty(), w.winfo_width(), w.winfo_height())
+            except tk.TclError:
+                continue
+        return None
+
     def _place_submenu(self, dw, dh):
-        """Right-aligned submenu anchored to the widget, virtual-desktop safe."""
+        """The menu opens at the hamburger: right edge to its right edge, just
+        below it (above it when there is no room below). It used to open flush
+        against the whole widget, away from the button that opened it."""
+        anchor = self._menu_anchor()
+        if anchor:
+            ml, mt, mr, mb = self._widget_monitor_area()
+            ax, ay, aw, ah = anchor
+            x = ax + aw - dw
+            # Above the button when there is room, so that it stands clear of
+            # the bar and the robot under the title; below it, over the widget,
+            # only when the widget is too near the top of its screen.
+            y = ay - dh - 4
+            if y < mt + SCREEN_MARGIN:
+                y = ay + ah + 4
+            x = max(ml + SCREEN_MARGIN, min(x, mr - dw - SCREEN_MARGIN))
+            y = max(mt + SCREEN_MARGIN, min(y, mb - dh - SCREEN_MARGIN))
+            return int(x), int(y)
         vx, vy, vw, vh = self._virtual_bounds()
         wx = self.root.winfo_rootx() + self.root.winfo_width() - dw
         widget_bottom = self.root.winfo_rooty() + self.root.winfo_height()
@@ -7970,12 +10673,31 @@ class Widget:
             win.update_idletasks()      # mapped out there: its frame exists now
             if rounded:
                 dwm_round(win)
+                if GLASS:
+                    # Rounder, to match the widget; and again at every size
+                    # the window takes (a menu is placed after it is built).
+                    win.bind('<Configure>', lambda e, wn=win: self._round_win(wn, e), add='+')
             win._cloaked = _set_cloak(_frame_of(win), True)
         except tk.TclError:
             return
         if not win._cloaked and not getattr(Widget, '_cloak_warned', False):
             Widget._cloak_warned = True
             wlog('SHOW   windows cannot be cloaked here: they show as they are placed')
+
+    def _round_win(self, win, e):
+        """A menu's or dialog's rounded region, made again when its size changes
+        and only then: setting a region is itself a change of the window, and
+        without the check this answered its own event for ever."""
+        try:
+            if e.widget is not win:
+                return
+            size = (win.winfo_width(), win.winfo_height())
+            if size == getattr(win, '_round_size', None) or min(size) < 20:
+                return
+            if round_region(_frame_of(win), size[0], size[1], sz(ROUND_R_MENU)):
+                win._round_size = size
+        except tk.TclError:
+            pass
 
     def _present(self, win, place, then=None, gone=None):
         """Show a prepared window, or one held still, once it is whole.
@@ -8737,19 +11459,37 @@ class Widget:
         self._lift_menu(m)
 
     def _flyout_set(self, fn):
-        """Apply a stateful change from a flyout, then refresh it so the new
-        state (radio dot / ON-OFF label) shows without closing the flyout.
+        """Apply a choice made in a flyout, then close the flyout.
 
-        A toggle can resize the widget, which briefly bounces focus and would
-        otherwise trip the autoclose. Reset the grace period on the menu and
-        flyout first so that focus bounce is ignored; a later widget click
-        (past the grace window) still closes the menu normally."""
+        A tap on an item of the sub-list is what ends it: it used to stay open
+        and refresh itself, so that the new state showed, and only a click
+        outside could dismiss it. The main menu is left as it is, and goes only
+        with a click outside (or with an item that acts, see _menu_do).
+
+        A choice can resize the widget, which briefly bounces focus and would
+        otherwise trip the autoclose of the menu that stays. Reset the grace
+        period on the menu first so that focus bounce is ignored; a later click
+        outside (past the grace window) still closes it normally."""
         now = time.monotonic()
         for win in (self._menu_win, self._flyout_win):
             if win is not None:
                 win._opened_at = now
         fn()
-        self._rebuild_flyout()
+        self._close_flyout()
+        # 🔴 This press is spent. The sub-list went at the moment of the press,
+        # and the watcher of outside clicks, still seeing the button down where
+        # the sub-list was, took it for a click outside and closed the whole
+        # menu. Marked as already down, it waits for the button to be released
+        # and counts only the next press.
+        self._menu_btn_down = self._any_mouse_down()
+        # Closing a window of the menu moves the focus: give it back to the
+        # menu that is still open, or the next click outside would not count.
+        try:
+            if self._menu_win is not None and self._menu_win.winfo_exists():
+                self._menu_win._opened_at = time.monotonic()
+                self._menu_win.focus_set()
+        except tk.TclError:
+            pass
 
     def _place_flyout(self, fw, fh, anchor):
         """Place a flyout beside the MAIN menu, aligned to its right edge with a
@@ -8791,7 +11531,7 @@ class Widget:
             self._menu_row(m, (t('menu_sync_on') if sync_on else t('menu_sync_off')),
                            lambda: self._flyout_set(lambda: self._toggle_sync_time(close=False)),
                            icon='\U0001F552︎', icon_ft=FT_EMOJI, tip=t('tip_sync'))
-            dyn = self.cfg.get('bar_dynamic', False)
+            dyn = self.cfg.get('bar_dynamic', GLASS)
             self._menu_row(m, (t('menu_colors_dynamic') if dyn else t('menu_colors_fixed')),
                            lambda: self._flyout_set(lambda: self._toggle_bar_dynamic(close=False)),
                            icon='\U0001F3A8︎', icon_ft=FT_EMOJI, tip=t('tip_colors'))
@@ -8813,6 +11553,18 @@ class Widget:
             self._menu_row(m, (t('menu_taskbar_on') if tb else t('menu_taskbar_off')),
                            lambda: self._flyout_set(self._toggle_taskbar),
                            icon='\U0001F4CC︎', icon_ft=FT_EMOJI, tip=t('tip_taskbar'))
+            dodge = self._dodge_enabled()
+            self._menu_row(m, (t('menu_dodge_on') if dodge else t('menu_dodge_off')),
+                           lambda: self._flyout_set(self._toggle_dodge),
+                           icon='\u2197\ufe0e', icon_ft=FT_EMOJI, tip=t('tip_dodge'))
+            robot = self.cfg.get('robot', GLASS)
+            self._menu_row(m, (t('menu_robot_on') if robot else t('menu_robot_off')),
+                           lambda: self._flyout_set(self._toggle_robot),
+                           icon='\u1F916', icon_ft=FT_EMOJI, tip=t('tip_robot'))
+            live = self.cfg.get('live_updates', True)
+            self._menu_row(m, (t('menu_live_on') if live else t('menu_live_off')),
+                           lambda: self._flyout_set(self._toggle_live),
+                           icon='\u26A1\uFE0E', icon_ft=FT_EMOJI, tip=t('tip_live'))
             self._menu_sep(m)
             self._menu_section(m, t('menu_theme'))
             theme = self.cfg.get('theme', 'dark')
@@ -8820,6 +11572,18 @@ class Widget:
                 self._menu_row(m, label,
                                lambda v=value: self._flyout_set(lambda: self._set_theme(v)),
                                marker=('\u25cf' if theme == value else '\u25cb'))
+            self._menu_section(m, t('menu_appearance'))
+            look = self.cfg.get('appearance', 'frost')
+            for value, label in (('frost', t('look_frost')), ('glass', t('look_glass')), ('classic', t('look_classic'))):
+                self._menu_row(m, label,
+                               lambda v=value: self._flyout_set(lambda: self._set_appearance(v)),
+                               marker=('\u25cf' if look == value else '\u25cb'))
+            self._menu_section(m, t('menu_size'))
+            cur_scale = scale_setting(self.cfg)
+            for value in UI_SCALE_CHOICES:
+                self._menu_row(m, f'{round(value * 100)}%',
+                               lambda v=value: self._flyout_set(lambda: self._set_ui_scale(v)),
+                               marker=('\u25cf' if abs(cur_scale - value) < 1e-6 else '\u25cb'))
             self._menu_row(m, t('menu_restart'),
                            lambda: self._menu_do(self._restart_widget),
                            icon=ICON_RESTART, icon_ft=FT_MDL2_MENU,
@@ -9563,7 +12327,7 @@ class Widget:
     def _toggle_bar_dynamic(self, close=True):
         """Switch the whole widget between the fixed per-bar palette and the
         percentage-driven one (all bars then share the usage-level colours)."""
-        new = not self.cfg.get('bar_dynamic', False)
+        new = not self.cfg.get('bar_dynamic', GLASS)
         self.cfg['bar_dynamic'] = new
         save_cfg(self.cfg)
         wlog(f'PALETTE bar_dynamic -> {new}')
@@ -13745,6 +16509,8 @@ class Widget:
         Now we raise the widget first and then the menu on top of it - both
         stay topmost and the menu keeps visual priority.
         """
+        if getattr(self, '_yielding', False):
+            return                  # a restart is handing the screen to the new widget
         try:
             hwnd = getattr(self, '_hwnd', None)
             if not hwnd:
@@ -13757,15 +16523,24 @@ class Widget:
             # is not moved here: it stays where it was put, directly above the
             # widget as it was, under the widget's own popups (Windows keeps
             # a window's popups above it) and over what was under the widget.
-            ctypes.windll.user32.SetWindowPos(
-                hwnd, -1, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010)
-            self.root.attributes('-topmost', True)
+            tn = self._tint_hwnds()
+            if tn and z_blocked(tn[0]):
+                raise_topmost(tn[0])                # the frost's dark first, so the widget goes over it
+            if z_blocked(hwnd, tn):
+                raise_topmost(hwnd)
+                if not self._dragging_now():
+                    self.root.attributes('-topmost', True)
+            for sh in self._sheen_hwnds():
+                if z_blocked(sh, (hwnd,)):
+                    raise_topmost(sh)               # directly above the widget, under everything of its own
             self._raise_covered_dialogs()
             # Keep the menu above the widget when it's open, and its flyout
             # with it: a re-raised page covered the flyout (third iteration).
+            chain = [hwnd, *self._sheen_hwnds()]
             for m in (self._menu_win, self._flyout_win):
                 if m and m.winfo_exists():
-                    self._raise_window(m)
+                    self._raise_window(m, tuple(chain))
+                    chain.append(ctypes.windll.user32.GetParent(m.winfo_id()) or m.winfo_id())
         except Exception:
             pass
 
@@ -13783,13 +16558,15 @@ class Widget:
         self._topmost_job = self.root.after(10, self._keep_topmost)
 
     @staticmethod
-    def _raise_window(win):
+    def _raise_window(win, below=()):
         """To the top of the topmost band, without moving, resizing or
         activating it. A still picture standing in for it (_hold, and the one
         of the window it replaces) goes back above it: raised alone, the
         hidden window went over its own picture and the widget over both."""
         hwnd = ctypes.windll.user32.GetParent(win.winfo_id()) or win.winfo_id()
-        ctypes.windll.user32.SetWindowPos(hwnd, -1, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010)
+        if not z_blocked(hwnd, below):
+            return                  # already where it belongs: leave the stack alone
+        raise_topmost(hwnd)
         for still in (getattr(win, '_stand_in', None), getattr(win, '_still', None)):
             if still is not None:
                 still.lift()
@@ -13815,6 +16592,7 @@ class Widget:
         """
         alive = []
         raising = False
+        chain = [getattr(self, '_hwnd', 0), *self._sheen_hwnds()]      # what each window must be above
         # The widget, and the picture standing in for it while it changes
         # (_reshape): the picture has the size it had.
         widget = [(self.root.winfo_rootx(), self.root.winfo_rooty(),
@@ -13844,7 +16622,8 @@ class Widget:
                                   and wy < dy + dh_ for dx, dy, dw_, dh_ in rects
                                   for wx, wy, ww, wh in widget)
                 if raising:
-                    self._raise_window(dlg)
+                    self._raise_window(dlg, tuple(chain))
+                    chain.append(ctypes.windll.user32.GetParent(dlg.winfo_id()) or dlg.winfo_id())
             except tk.TclError:
                 continue
         self._open_dialogs = alive
@@ -13861,7 +16640,7 @@ class Widget:
         for win in [*tips, self._update_banner, self._flyout_win]:
             try:
                 if win is not None and win.winfo_exists() and win.winfo_ismapped():
-                    self._raise_window(win)
+                    self._raise_window(win, tuple(chain))
             except tk.TclError:
                 continue
 
@@ -13882,6 +16661,11 @@ class Widget:
             self._quit_geometry_saved = True
         except tk.TclError:
             pass
+        self._dodge_stop()
+        for nm in ('_sheen', '_tint'):
+            if getattr(self, nm, None):
+                getattr(self, nm).close()
+                setattr(self, nm, None)
         for job in ('_job', '_countdown_job', '_topmost_job', '_pulse_job'):
             jid = getattr(self, job, None)
             if jid:
@@ -13938,6 +16722,13 @@ class Widget:
         self._close_menu()
         if not getattr(self, '_quit_geometry_saved', False):
             self._save_geometry()
+        self._dodge_stop()
+        for nm in ('_sheen', '_tint'):
+            if getattr(self, nm, None):
+                getattr(self, nm).close()
+                setattr(self, nm, None)
+        if self._tray:
+            self._tray.close()
         if self._job:
             self.root.after_cancel(self._job)
         if self._countdown_job:
