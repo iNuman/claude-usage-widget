@@ -2,8 +2,8 @@
 ; Run from the installer/ folder. All Source paths are relative to this script.
 
 #define MyAppName "Claude Usage"
-#define MyAppVersion "2.12.1"
-#define MyAppPublisher "Niccolo Sabato"
+#define MyAppVersion "2.12.2"
+#define MyAppPublisher "iNuman (fork of Niccolo Sabato's Claude Usage Widget)"
 #define MyAppExeName "Claude Usage.exe"
 #define MyAppIcon "claude.ico"
 
