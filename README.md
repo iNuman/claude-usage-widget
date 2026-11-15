@@ -15,6 +15,19 @@
 
 A lightweight desktop tool that shows your **Claude.ai session limit, weekly limit and Sonnet limit** as live progress bars so you never get cut off mid-conversation. It is **designed to sit on a free spot of the Windows 11 taskbar** in its compact **essential mode**: low profile, never overflows the screen, never blocks your work. The position you choose is remembered across restarts, so once you place it you never have to touch it again.
 
+## What's new in this build (2.12)
+
+[![The new frosted glass look, dark and light. Click to watch the demo video.](docs/images/glass-look.png)](docs/demo.mp4)
+
+*Click the picture to watch the demo video (`docs/demo.mp4`).*
+
+- **A glass look**: *Frost* (see-through, blurred, Windows 11 dark theme), *Glass* (opaque tint, also for the light theme) or the *Classic* look, with rounded corners, a soft sheen, glossy bars, usage- and pace-aware colours and a small robot riding the session bar. Frost cannot be drawn on a display in HDR, so the widget uses Glass there and switches by itself when you move it to another display
+- **Move out of the way** (on by default): when the widget covers something and the pointer comes towards it, it slides clear the shortest way and slides back when you leave. It stays put when it covers nothing or while a menu is open, and **Ctrl** pins it. A **taskbar tray icon** switches it on and off
+- **Live updates**: the bars glide, the reset text counts down and the usage is read again shortly after Claude Code is used
+- **Size**: 100 / 125 / 150 / 175 %, under Display > Size
+
+**Install**: download `ClaudeUsage-Setup.exe` from this repository's [Releases](https://github.com/iNuman/claude-usage-widget/releases/latest). The installer is not code-signed, so Windows SmartScreen may ask you to choose *More info > Run anyway*. This is a build from a fork, so the in-app update check (which looks at the upstream project) will not update it.
+
 ## Features at a glance
 
 - **Lives on the taskbar** in a compact essential mode, or as a full window when you want the detail
