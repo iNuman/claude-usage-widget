@@ -2,7 +2,7 @@
 
 **Claude Session Key** (Chrome extension) and **Claude Usage Widget** (desktop application).
 
-Last updated: 2026-10-21
+Last updated: 2026-11-15
 
 ## Summary
 
@@ -34,6 +34,8 @@ The "Claude Usage Widget" desktop application:
 - Reads, from the same usage endpoint, the usage-limit resets Anthropic has granted an account. When the user chooses to use one on an account's page, and confirms, it sends that request to `claude.ai/api/organizations/{org_id}/reset_rate_limits` with the session key, as claude.ai's own Usage page does. Nothing is redeemed without that confirmation.
 - Stores configuration locally in `%LOCALAPPDATA%\Claude Usage\config.json`: position, size, language, theme, the session key, and for each account the identity the profile endpoint returns (e-mail address, organisation, plan), which is how the widget knows whose numbers it is showing.
 - Keeps a copy of Claude Code's login for each account it can switch Claude Code to, as described below.
+- With **Live updates** on (the default), notes the *modification time* of the files under `%USERPROFILE%\.claude\projects` (the session transcripts Claude Code writes) so that it can refresh a moment after Claude Code is used. It lists file names and reads their timestamps; it never opens or reads a transcript, and nothing from it is stored or sent.
+- In the glass looks, looks at which windows lie under the widget (their position, size and title, in memory only) so that it moves out of the way only when it covers something, and, to follow the colours behind it, captures a few screen pixels in a narrow ring around the widget and averages them. Only the averaged colour is kept, in memory; the pixels are discarded at once and are never stored or sent.
 - Writes diagnostic logs locally to `%LOCALAPPDATA%\Claude Usage\widget.log`. No credential is ever written to them, and text arriving from outside the program (the output of `curl`, for instance) has session keys, tokens, organisation ids, e-mail addresses and the Windows account name stripped out before it is stored.
 - When the user turns on **Start with Windows**, writes one value, `ClaudeUsageWidget`, under `HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Run`, holding the path of the widget, and clears the mark Windows keeps for that entry if it was disabled in Task Manager. Turning the option off removes the value. Uninstalling removes it too, unless the uninstaller runs under another Windows account (another administrator approving it); in that case, turn the option off before uninstalling.
 

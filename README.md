@@ -15,6 +15,19 @@
 
 A lightweight desktop tool that shows your **Claude.ai session limit, weekly limit and Sonnet limit** as live progress bars so you never get cut off mid-conversation. It is **designed to sit on a free spot of the Windows 11 taskbar** in its compact **essential mode**: low profile, never overflows the screen, never blocks your work. The position you choose is remembered across restarts, so once you place it you never have to touch it again.
 
+## What's new in this build (2.12)
+
+[![The new frosted glass look, dark and light. Click to watch the demo video.](docs/images/glass-look.png)](docs/demo.mp4)
+
+*Click the picture to watch the demo video (`docs/demo.mp4`).*
+
+- **A glass look**: *Frost* (see-through, blurred, Windows 11 dark theme), *Glass* (opaque tint, also for the light theme) or the *Classic* look, with rounded corners, a soft sheen, glossy bars, usage- and pace-aware colours and a small robot riding the session bar. Frost cannot be drawn on a display in HDR, so the widget uses Glass there and switches by itself when you move it to another display
+- **Move out of the way** (on by default): when the widget covers something and the pointer comes towards it, it slides clear the shortest way and slides back when you leave. It stays put when it covers nothing or while a menu is open, and **Ctrl** pins it. A **taskbar tray icon** switches it on and off
+- **Live updates**: the bars glide, the reset text counts down and the usage is read again shortly after Claude Code is used
+- **Size**: 100 / 125 / 150 / 175 %, under Display > Size
+
+**Install**: download `ClaudeUsage-Setup.exe` from this repository's [Releases](https://github.com/iNuman/claude-usage-widget/releases/latest). The installer is not code-signed, so Windows SmartScreen may ask you to choose *More info > Run anyway*. This is a build from a fork, so the in-app update check (which looks at the upstream project) will not update it.
+
 ## Features at a glance
 
 - **Lives on the taskbar** in a compact essential mode, or as a full window when you want the detail
@@ -133,6 +146,7 @@ The widget connects to Claude.ai using the same browser session you are already 
 - Three usage bars with reset times and a live countdown to the next refresh
 - Auto refresh every 3 minutes by default, configurable from 10 seconds to 1 hour
 - Instant refresh when a reset time is reached, no waiting for the next tick
+- **Live updates**: the bars glide to a new value instead of jumping, the reset text counts down live, and the widget refreshes by itself shortly after Claude Code writes to a session, so the session bar follows your work without waiting for the interval. It only looks at the *modification times* of the files under `~/.claude/projects`, never their contents. Off under Display > Live updates.
 - **Threshold notifications**: native Windows toast when session usage crosses 25 / 50 / 75 / 90 / 95 / 100 %, so you know you are approaching the limit even when focused on another window. Toggle on/off from the menu.
 - **Optional Win11 taskbar progress overlay** under the app icon: fill width tracks session usage, colour escalates from accent (0-74 %) to yellow (75-89 %) to red (90 % +). The same overlay Edge or Explorer paint during a download.
 
@@ -146,6 +160,10 @@ The widget connects to Claude.ai using the same browser session you are already 
 
 - **Countdown as a pulsing green dot** (default) or as a numeric value, your choice
 - **Sync time** display toggle for the last-update timestamp
+- **Looks**: *Frost* (a see-through, blurred glass over whatever is behind the widget, with a soft sheen; Windows 11, dark theme), *Glass* (the same look on an opaque, tinted panel, which also follows the light theme) and *Classic* (the original look). Frost needs a display that is not in HDR, so the widget uses Glass on an HDR display and switches by itself when you move it between displays
+- **Size**: 100 / 125 / 150 / 175 % (125 % by default in the glass looks), for the whole widget
+- **Robot at work**: a small robot rides the leading edge of the session bar. Off under Display > Robot
+- **Move out of the way** (on by default): when the widget covers something and the pointer comes towards it, it slides the shortest way clear (up, down, left or right, depending on where you came from) and slides back when the pointer leaves. It stays put when it covers nothing, while a menu is open, and while Ctrl is held. The taskbar icon of the widget toggles it, and so does Display > Move out of the way
 - Native Windows 11 design language: DWM rounded corners, translucent background, anti-aliased pill buttons rendered with a 4x supersample
 - DPI-aware: tested at 100 %, 125 %, 150 %, 175 % and 200 % scaling; dialogs auto-size so nothing is clipped on high-DPI displays, and an account page taller than the screen scrolls, with its buttons always in view
 
@@ -232,6 +250,7 @@ Open it with **≡**, the **☰** button, or by right-clicking the bar in essent
 - **Refresh** and the **Normal / Essential** mode toggle (top level)
 - **Display**: countdown as a pulsing dot or a numeric value, the sync-time timestamp on/off, fixed or dynamic bar colours, the dark or light theme with a restart button
   beside it, the taskbar icon and its Win11 progress overlay, what the line **under the bars** carries (the reset time, the time left, both or neither), the weekly split, and which bars to show (each with a colour swatch). Hover any option for a short explanation.
+- **Display** also holds the **Look** (Frost / Glass / Classic), **Size**, **Robot at work**, **Live updates** and **Move out of the way**; changing the look, theme or size restarts the widget by itself with a short crossfade
 - **Data & alerts**: refresh interval (10 to 3600 s) and threshold notifications
 - **Accounts**: opens the accounts window directly (add, switch, rename, remove, update each session key), with a link to the Claude.ai usage page
 - **General**: language (EN / IT / JA), start with Windows, check for updates, open the GitHub repo, open `config.json`, run the connection self-test
@@ -257,6 +276,12 @@ The widget manages its own config at `%LOCALAPPDATA%\Claude Usage\config.json`. 
   "bar_dynamic": false,                  // colour bars by usage level instead of per bar
   "bar_colors": {},                      // per-bar colour overrides from the picker
   "weekly_split": 0,                     // 3-7: the weekly bar in that many equal parts; 0 off
+  "appearance": "frost",                 // "frost" | "glass" | "classic"
+  "ui_scale": 1.25,                      // 1.0 | 1.25 | 1.5 | 1.75: the size of the whole widget
+  "auto_dodge": true,                    // slide clear of what it covers when the pointer comes
+  "robot": true,                         // the robot on the session bar (glass looks)
+  "live_updates": true,                  // glide the bars, tick the reset text, follow Claude Code activity
+  "sheen": true,                         // the soft light over the glass looks
   "update_check_enabled": true,          // false: never ask GitHub for updates
   "always_check_updates": false,         // skip the 24h update-check throttle
   "debug_tk_scaling": null               // simulate higher DPI for layout testing
