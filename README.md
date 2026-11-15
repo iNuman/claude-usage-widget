@@ -371,7 +371,7 @@ This widget reads usage data from `claude.ai/api/organizations/{id}/usage`, the 
 
 ## License
 
-MIT License © 2026 Niccolò Sabato. See [LICENSE](LICENSE).
+MIT License © 2026 Niccolò Sabato (original project) and © 2026 iNuman (modifications and additions in this fork). See [LICENSE](LICENSE).
 
 ---
 
