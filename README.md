@@ -348,9 +348,20 @@ Open **≡ > General > Connection self-test**. It follows the path a request act
 
 `%LOCALAPPDATA%\Claude Usage\` holds `widget.log` (rolling activity, including every self-test run) and `crash.log` if the widget ever fails to start. Neither contains your session key.
 
-## Contributing
+## About this version and contributing
 
-This is a personal project shared because it might be useful to others. Bugs, feature requests and pull requests are welcome via [GitHub Issues](https://github.com/niccolo-sabato/claude-usage-widget/issues).
+This is an **optimized, extended version of the [Claude Usage Widget](https://github.com/niccolo-sabato/claude-usage-widget) by [Niccolò Sabato](https://github.com/niccolo-sabato)**. The idea, the way it reads your usage, the accounts and Claude Code login handling, the multi-language support and the taskbar design are his work, and they remain the foundation of this version. Credit and thanks to him for building it and sharing it under the MIT license.
+
+What this version adds on top of the original, as a substantial rework of how the widget looks and behaves:
+
+- a new **glass look** (Frost, Glass and Classic) with rounded corners, glossy bars, a soft sheen, usage- and pace-aware colours and a small robot on the session bar
+- **live updates**: bars that glide, a reset text that counts down, and a refresh that follows Claude Code activity
+- **move out of the way**, with a tray icon to switch it on and off
+- a **size setting** (100 to 175 %), a fix for the title bar clipping, and HDR-aware behaviour for the Frost look
+
+It is released under the same MIT license, and the original copyright notice is kept in [LICENSE](LICENSE).
+
+**Pull requests for this version** are welcome on this repository. For bugs or ideas about the original widget, or to use the original as it is, go to the [upstream project](https://github.com/niccolo-sabato/claude-usage-widget) and its [Issues](https://github.com/niccolo-sabato/claude-usage-widget/issues).
 
 If the widget saves you a frustrating mid-conversation cut-off, a star on the repo is the best thank-you.
 
