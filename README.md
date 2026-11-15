@@ -3,9 +3,9 @@
 > **Track your Claude.ai usage limits in real time from a tiny widget that sits in an empty spot of your Windows 11 taskbar.** Free, open source, no telemetry.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Windows](https://img.shields.io/badge/Windows-10%2F11-blue.svg)](https://github.com/niccolo-sabato/claude-usage-widget/releases/latest)
-[![Latest release](https://img.shields.io/github/v/release/niccolo-sabato/claude-usage-widget)](https://github.com/niccolo-sabato/claude-usage-widget/releases/latest)
-[![Downloads](https://img.shields.io/github/downloads/niccolo-sabato/claude-usage-widget/total.svg)](https://github.com/niccolo-sabato/claude-usage-widget/releases)
+[![Windows](https://img.shields.io/badge/Windows-10%2F11-blue.svg)](https://github.com/iNuman/claude-usage-widget/releases/latest)
+[![Latest release](https://img.shields.io/github/v/release/iNuman/claude-usage-widget)](https://github.com/iNuman/claude-usage-widget/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/iNuman/claude-usage-widget/total.svg)](https://github.com/iNuman/claude-usage-widget/releases)
 
 ![The widget on the Windows 11 taskbar showing a single session bar](docs/images/taskbar-single.png)
 
@@ -15,27 +15,31 @@
 
 A lightweight desktop tool that shows your **Claude.ai session limit, weekly limit and Sonnet limit** as live progress bars so you never get cut off mid-conversation. It is **designed to sit on a free spot of the Windows 11 taskbar** in its compact **essential mode**: low profile, never overflows the screen, never blocks your work. The position you choose is remembered across restarts, so once you place it you never have to touch it again.
 
-## What's new in this build (2.12)
+## What's new in this build (2.12.1)
 
 [![The new frosted glass look, dark and light. Click to watch the demo video.](docs/images/glass-look.png)](docs/demo.mp4)
 
-*Click the picture to watch the demo video (`docs/demo.mp4`).*
+*Click the picture to watch the demo video ([`docs/demo.mp4`](docs/demo.mp4)); it is also attached to the latest release.*
 
 - **A glass look**: *Frost* (see-through, blurred, Windows 11 dark theme), *Glass* (opaque tint, also for the light theme) or the *Classic* look, with rounded corners, a soft sheen, glossy bars, usage- and pace-aware colours and a small robot riding the session bar. Frost cannot be drawn on a display in HDR, so the widget uses Glass there and switches by itself when you move it to another display
 - **Move out of the way** (on by default): when the widget covers something and the pointer comes towards it, it slides clear the shortest way and slides back when you leave. It stays put when it covers nothing or while a menu is open, and **Ctrl** pins it. A **taskbar tray icon** switches it on and off
 - **Live updates**: the bars glide, the reset text counts down and the usage is read again shortly after Claude Code is used
 - **Size**: 100 / 125 / 150 / 175 %, under Display > Size
+- **A robot at work**: a small robot rides the leading edge of the session bar and moves along as it fills (Display > Robot)
 
 **Install**: download `ClaudeUsage-Setup.exe` from this repository's [Releases](https://github.com/iNuman/claude-usage-widget/releases/latest). The installer is not code-signed, so Windows SmartScreen may ask you to choose *More info > Run anyway*. This is a build from a fork, so the in-app update check (which looks at the upstream project) will not update it.
 
 ## Features at a glance
 
 - **Lives on the taskbar** in a compact essential mode, or as a full window when you want the detail
+- **A frosted-glass look** (Frost, Glass or Classic) with rounded corners, glossy bars and a soft sheen, in four sizes from 100 to 175 %
+- **Moves out of your way**: slides clear of whatever it covers when the pointer comes, and back again; a tray icon switches it on and off
+- **Live updates**: bars glide, the reset text counts down, and the usage is read again shortly after Claude Code is used
 - **Three live usage bars:** session (5h), weekly (7d) and the per-model weekly limit, each with a reset countdown
 - **Pick the bars you want:** show one, two or three at once, side by side or stacked; the same choice applies to both modes
 - **Multiple accounts:** save several Claude logins, switch instantly, each with its own name and colour
 - **Switch Claude Code between your accounts** from the widget, with each saved login renewed and checked before it goes live
-- **Bar colours your way:** a fixed colour per bar (with an in-app picker), or a dynamic palette that tracks the usage level
+- **Bar colours your way:** a fixed colour per bar (with an in-app picker), or a dynamic palette that tracks the usage level (in the glass looks, how fast you are using it as well as how much)
 - **Refresh countdown** shown as a quiet pulsing dot or as a numeric value, your choice
 - **Threshold toast notifications** when session usage crosses 25 / 50 / 75 / 90 / 95 / 100 %
 - **Start with Windows:** one toggle in the menu (General) to launch the widget at sign-in
@@ -86,6 +90,12 @@ Essential mode is flexible. Show just the session bar for the smallest footprint
 Every part of the strip is either optional or measured against what it actually
 draws, so the width you end up with is the width of what you chose to see.
 
+The numbers below are for the **Classic** look at **100 %** size on a 96-DPI
+display. The glass looks and the larger sizes scale everything up in step (at
+the default 125 % the strips in the pictures are about a quarter wider, plus
+the glass look's own padding), and Windows display scaling multiplies it
+again; the pictures below were taken at 125 % on a 150 % display.
+
 | On screen | Minimum width |
 |---|---|
 | One bar, time left only | 150 px |
@@ -119,13 +129,13 @@ Switch back to essential mode the same way. Whichever mode you choose is remembe
 
 ## Download
 
-[**Download latest release**](https://github.com/niccolo-sabato/claude-usage-widget/releases/latest) - one-click installer (~15 MB)
+[**Download latest release**](https://github.com/iNuman/claude-usage-widget/releases/latest) - one-click installer (~14 MB). This is a fork of [niccolo-sabato/claude-usage-widget](https://github.com/niccolo-sabato/claude-usage-widget) (MIT); the original project's releases are [here](https://github.com/niccolo-sabato/claude-usage-widget/releases/latest).
 
 | | |
 |---|---|
 | **Platform** | Windows 10 (1809+) and Windows 11, x64 |
 | **Install size** | ~50 MB on disk |
-| **Auto-update** | Yes, in-app via GitHub Releases |
+| **Auto-update** | The in-app update check follows the upstream project; this fork's builds are updated by downloading the new installer from Releases |
 | **Telemetry** | None |
 | **Source** | 100 % open source ([widget.pyw](src/widget.pyw)) |
 
@@ -154,7 +164,7 @@ The widget connects to Claude.ai using the same browser session you are already 
 - **Essential mode** for the taskbar: compact, no title bar, one or several bars side by side, all controls condensed at the bottom right
 - **Standard mode** for desktop placement: full title bar, the selected bars stacked with labels and section dividers
 - **Bars to show** picker: choose which bars appear; the same choice drives both modes
-- **Bar colours**: a fixed colour per bar chosen from an in-app picker (four presets plus a full colour wheel), or a dynamic palette that colours every bar by its usage level
+- **Bar colours**: a fixed colour per bar chosen from an in-app picker (four presets plus a full colour wheel), or a dynamic palette that colours every bar by its usage level (the glass looks also weigh the pace: 25 % used 10 % into the window reads as a warmer colour than 25 % used near its end)
 - **Dark or light theme**: the light one is a full palette, not an inverted dark one. Tk builds a widget with the colour it is given, so the choice applies when the widget starts and the menu has a restart right under it
 - **Weekly split**: the 7-day bar can be divided into 3 to 7 equal parts, for instance one for each day you work, so you can see how many days' worth of the week you have used. Off by default, under Display > Weekly split
 
@@ -164,10 +174,10 @@ The widget connects to Claude.ai using the same browser session you are already 
 - **Size**: 100 / 125 / 150 / 175 % (125 % by default in the glass looks), for the whole widget
 - **Robot at work**: a small robot rides the leading edge of the session bar. Off under Display > Robot
 - **Move out of the way** (on by default): when the widget covers something and the pointer comes towards it, it slides the shortest way clear (up, down, left or right, depending on where you came from) and slides back when the pointer leaves. It stays put when it covers nothing, while a menu is open, and while Ctrl is held. The taskbar icon of the widget toggles it, and so does Display > Move out of the way
-- Native Windows 11 design language: DWM rounded corners, translucent background, anti-aliased pill buttons rendered with a 4x supersample
+- Native Windows 11 design language: rounded corners, a frosted or glass panel, anti-aliased glossy bars and pill buttons rendered with a supersample
 - DPI-aware: tested at 100 %, 125 %, 150 %, 175 % and 200 % scaling; dialogs auto-size so nothing is clipped on high-DPI displays, and an account page taller than the screen scrolls, with its buttons always in view
 
-![The widget in the light theme](docs/images/normal-light.png)
+![The widget in the light theme (Glass look)](docs/images/normal-light.png)
 
 ### Accounts
 - **Save multiple Claude logins** and switch between them instantly; the widget refreshes to the selected account right away
@@ -226,7 +236,7 @@ The account page, behind **Manage**, and the avatar picker behind the circle:
 | Element | Action |
 |---|---|
 | Claude icon + "Claude Usage" | Drag to move |
-| Current time | System clock (HH:MM) |
+| Current time | System clock (HH:MM). The glass looks leave it out, since the green last-sync time below already says when the numbers were read |
 | ↻ | Force immediate refresh |
 | ≡ | Settings menu |
 | ✕ | Quit (saves geometry) |
@@ -240,6 +250,19 @@ The account page, behind **Manage**, and the avatar picker behind the circle:
 | ☰ (essential mode) | Click | Open the settings menu |
 | Either dot | Hover | A tooltip says what the gesture does |
 | The line under a bar | Hover | The reset in full, and which account the numbers are for |
+
+### Taskbar tray icon
+
+The widget has a small icon in the notification area (it may sit under the **^**
+arrow).
+
+| Gesture | Action |
+|---|---|
+| Click | Switch **Move out of the way** on or off |
+| Right-click | Menu with the same switch and **Quit** |
+
+While the widget is out of the way it stays put if a menu is open, and holding
+**Ctrl** pins it where it is.
 
 ### Settings menu
 
@@ -273,7 +296,7 @@ The widget manages its own config at `%LOCALAPPDATA%\Claude Usage\config.json`. 
   "show_reset_time": true,               // the reset clock on the line under the bars
   "show_reset_left": true,               // the time left on that same line
   "essential_bars": ["session"],         // bars to show, in both modes
-  "bar_dynamic": false,                  // colour bars by usage level instead of per bar
+  "bar_dynamic": false,                  // colour bars by usage level instead of per bar (true by default in the glass looks)
   "bar_colors": {},                      // per-bar colour overrides from the picker
   "weekly_split": 0,                     // 3-7: the weekly bar in that many equal parts; 0 off
   "appearance": "frost",                 // "frost" | "glass" | "classic"
@@ -302,7 +325,9 @@ The widget is a single-file Python source (`src/widget.pyw`) using tkinter for t
 
 ## Known behaviors
 
-- **Windows 10:** square corners (DWM rounded corners require Windows 11)
+- **Windows 10:** the Classic look has square corners (DWM rounded corners require Windows 11). The glass looks draw their own rounded corners; **Frost** needs Windows 11 (build 22621 or later) and falls back to Glass
+- **HDR displays:** Frost cannot be drawn on a display that has HDR turned on (Windows composes it differently), so the widget uses Glass there, and switches by itself when you move it to a display without HDR. To get Frost on an HDR display, turn HDR off for it (**Win+Alt+B** toggles it)
+- **Move out of the way** looks at the windows under the widget (their position, size and title, in memory only). It does nothing when the widget covers only the desktop, and it ignores windows with no title
 - **Session expiry:** Claude.ai session keys typically last about 30 days or until you log out. The widget shows a clear notice when this happens; update the key from **≡ > Accounts**
 - **TLS via curl:** the widget calls the `curl` found on `PATH` instead of Python's `urllib`, because Cloudflare in front of claude.ai fingerprints the TLS handshake (JA3) and blocks Python's OpenSSL stack. Windows ships a schannel build, which uses the Windows certificate store; the connection self-test says so when a different one comes first
 
